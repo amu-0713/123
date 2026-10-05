@@ -1,6 +1,0 @@
-開發/cache/
-.env
-__pycache__/
-*.pyc
-*.pkl
-nul
