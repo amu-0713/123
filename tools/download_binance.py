@@ -15,6 +15,7 @@
         open_time,open,high,low,close,volume,quote_volume,trades,taker_buy_base,taker_buy_quote
     <out>/spot/<interval>/_symbols.csv   每個幣的起訖日期、筆數、是否已停止更新（疑似下市）
     <out>/_cache/                        原始 zip 快取，中斷後重跑會跳過已下載的檔案
+    ./binance_spot_<interval>.zip        跑完自動打包（不含快取），直接上傳這個檔（--no-zip 可關閉）
 
 注意：
     * 2025-01-01 起現貨資料的時間戳改為微秒，這裡會自動判斷。
@@ -202,6 +203,7 @@ def main():
     ap.add_argument("--out", default="data")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--keep-all", action="store_true", help="不排除穩定幣與槓桿代幣")
+    ap.add_argument("--no-zip", action="store_true", help="跑完不要打包成 zip")
     a = ap.parse_args()
 
     out_dir = os.path.join(a.out, "spot", a.interval)
@@ -242,6 +244,15 @@ def main():
     print(f"\n完成：{len(summary)} 成功，{len(failed)} 失敗")
     if failed:
         print("失敗的幣種（重跑會從快取續傳）：", " ".join(failed))
+
+    if not a.no_zip:
+        zip_path = f"binance_spot_{a.interval}.zip"
+        base = os.path.dirname(os.path.abspath(a.out))     # zip 內路徑為 data/spot/<interval>/...
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+            for name in sorted(os.listdir(out_dir)):
+                p = os.path.join(out_dir, name)
+                z.write(p, os.path.relpath(os.path.abspath(p), base))
+        print(f"已打包：{os.path.abspath(zip_path)}（{os.path.getsize(zip_path) / 1e6:.1f} MB）→ 上傳這個檔案即可")
 
 
 if __name__ == "__main__":
