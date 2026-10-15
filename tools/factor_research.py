@@ -333,7 +333,8 @@ def trend_signal(P, spec):
 
 
 def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", pool=None, exit_gate=None,
-             entry_ok=None, fallback=None, fallback_ok=None):
+             entry_ok=None, fallback=None, fallback_ok=None,
+             cooldown=0, cooldown_btc=True, exit_gate_new=None, new_weeks=0):
     """
     gate：各幣趨勢開關（DataFrame bool）
       gate_mode="slot"   先依分數選前 k 名，趨勢不成立的那一格改持有現金（每格固定 1/k）
@@ -344,6 +345,8 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
     entry_ok：Series bool。調倉日為 False 時不買進新幣，只保留上一期仍持有、且仍符合條件的幣。
     fallback："BTC" 或 "top1"（當期分數第一名）。fallback_ok 為 True 的調倉日，空出來的格子改買這個幣，
       不放現金（該幣可能因此超過 1/k）。
+    cooldown：某幣被每日出場停損後，接下來 N 個調倉日不准再買（cooldown_btc=False 時 BTC 不受限）。
+    exit_gate_new / new_weeks：連續持有未滿 new_weeks 個調倉日的幣用較緊的 exit_gate_new，之後改用 exit_gate。
     """
     px = P["close_ff"]
     idx = px.index
@@ -354,7 +357,10 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
     rets = pd.Series(0.0, index=idx)
     turnover, w_prev, holdings = [], pd.Series(dtype=float), []
     held = set()                                                            # 上一期結束時仍持有的幣
+    banned = {}                                                             # 冷卻中的幣 → 可再買的調倉序號
+    age = {}                                                                # 連續持有的調倉期數
     for i, t in enumerate(dates):
+        blocked = {c for c, until in banned.items() if i < until}
         # ---- 決定目標權重
         s = score.loc[t].dropna()
         if gate is not None and gate_mode == "fill":
@@ -364,6 +370,8 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
             s = s[gate.loc[t].reindex(s.index).fillna(False).astype(bool)]
         if eok is not None and not eok.loc[t]:
             s = s[s.index.isin(held)]                                       # 市場不佳：不買新幣
+        if blocked:
+            s = s[~s.index.isin(blocked)]                                   # 停損冷卻中
         pick = s.nlargest(k).index
         if not on.loc[t] or not len(pick):
             w = pd.Series(dtype=float)
@@ -374,7 +382,7 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
             w = pd.Series(1.0 / len(pick), index=pick)
         if fallback and fok is not None and fok.loc[t] and w.sum() < 1 - 1e-9:
             fb = "BTC" if fallback == "BTC" else (score.loc[t].dropna().idxmax() if score.loc[t].notna().any() else None)
-            if fb is not None and pd.notna(px.loc[t].get(fb)):
+            if fb is not None and pd.notna(px.loc[t].get(fb)) and not (fb in blocked and cooldown_btc):
                 w = w.add(pd.Series({fb: 1 - w.sum()}), fill_value=0)
 
         # ---- 持有到下個調倉日
@@ -386,14 +394,22 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
         exited = []
         if len(w) and len(seg) > 1:
             rel = seg[w.index] / seg[w.index].iloc[0]                       # 期間內權重自然漂移
+            age = {c: (age.get(c, 0) + 1 if c in held else 0) for c in w.index}
             if exit_gate is not None:
                 eg = exit_gate.reindex(index=seg.index[1:], columns=w.index).fillna(True).astype(bool)
+                if exit_gate_new is not None and new_weeks:
+                    egn = exit_gate_new.reindex(index=seg.index[1:], columns=w.index).fillna(True).astype(bool)
+                    for col in w.index:
+                        if age[col] < new_weeks:
+                            eg[col] = egn[col]
                 for col in w.index:
                     off = eg.index[~eg[col].values]
                     if len(off):                                            # 當天收盤賣出，之後凍結為現金
                         d = off[0]
                         rel.loc[rel.index > d, col] = rel.loc[d, col] * (1 - fee)
                         exited.append(col)
+                        if cooldown:
+                            banned[col] = i + 1 + cooldown
             val = (rel * w).sum(axis=1) + (1 - w.sum())
             r = val.pct_change().iloc[1:]
             rets.loc[r.index] = r.values
@@ -448,6 +464,9 @@ def main(argv=None):
     ap.add_argument("--trend", default="", help="各幣趨勢開關，例如 sma100 / mom60 / donch60（空字串 = 不用）")
     ap.add_argument("--trend-mode", default="slot", choices=["slot", "filter", "fill"])
     ap.add_argument("--pool", type=int, default=0, help="fill 模式：只在分數前 N 名裡遞補")
+    ap.add_argument("--exit-ma-new", type=int, default=0, help="新倉出場均線：連續持有未滿 --new-weeks 週的幣用這條（0 = 不用）")
+    ap.add_argument("--new-weeks", type=int, default=2)
+    ap.add_argument("--cooldown", type=int, default=0, help="停損後 N 週內不再買同一個幣（0 = 不用）")
     ap.add_argument("--rel-btc", type=int, default=0,
                     help="相對強度：非 BTC 的幣還需「幣價/BTC」站上 N 日均線才可進場（0 = 不用）")
     ap.add_argument("--fallback", default="", choices=["", "BTC", "top1"],
@@ -515,7 +534,9 @@ def main(argv=None):
             fb_ok = base_gate["BTC"] if a.fallback == "BTC" else pd.Series(
                 [bool(base_gate.loc[t, sc.loc[t].idxmax()]) if sc.loc[t].notna().any() else False for t in dates], index=dates)
         r, tv, hold = backtest(sc, P, U, dates, a.k, reg, a.fee, gate, a.trend_mode, a.pool or None, exit_gate,
-                               fallback=a.fallback or None, fallback_ok=fb_ok)
+                               fallback=a.fallback or None, fallback_ok=fb_ok, cooldown=a.cooldown,
+                               exit_gate_new=(P["close"] >= P["close"].rolling(a.exit_ma_new).mean()) if a.exit_ma_new else None,
+                               new_weeks=a.new_weeks if a.exit_ma_new else 0)
         m = metrics(r)
         m["turnover_ann"] = tv.mean() * len(dates) / (len(r) / 365)
         invested = pd.Series([sum(float(x.split(":")[1]) for x in hh.split(",") if x) for _, hh in hold])
