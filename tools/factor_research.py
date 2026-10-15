@@ -286,15 +286,46 @@ def regime_filter(P, U, kind, n=100):
     raise ValueError(kind)
 
 
-def backtest(score, P, U, dates, k, regime, fee):
+def trend_signal(P, spec):
+    """
+    各幣自己的趨勢開關（True = 多頭）：
+      sma100   收盤 > 100 日均線
+      mom60    60 日報酬 > 0
+      donch60  收盤在 60 日高點的 10% 以內
+    """
+    c = P["close"]
+    kind, n = spec.rstrip("0123456789"), int(spec[len(spec.rstrip("0123456789")):])
+    if kind == "sma":
+        return c > c.rolling(n).mean()
+    if kind == "mom":
+        return c.pct_change(n, fill_method=None) > 0
+    if kind == "donch":
+        return c >= 0.9 * c.rolling(n).max()
+    raise ValueError(spec)
+
+
+def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot"):
+    """
+    gate：各幣趨勢開關（DataFrame bool）
+      gate_mode="slot"   先依分數選前 k 名，趨勢不成立的那一格改持有現金（每格固定 1/k）
+      gate_mode="filter" 只在趨勢成立的幣裡選前 k 名，資金平均分配（有幣就滿倉）
+    """
     px = P["close_ff"]
     idx = px.index
     on = regime.reindex(dates).fillna(False)
     target = {}
     for t in dates:
         s = score.loc[t].dropna()
-        target[t] = (pd.Series(1.0 / min(k, len(s)), index=s.nlargest(k).index)
-                     if on.loc[t] and len(s) else pd.Series(dtype=float))
+        if gate is not None and gate_mode == "filter":
+            s = s[gate.loc[t].reindex(s.index).fillna(False).astype(bool)]
+        pick = s.nlargest(k).index
+        if not on.loc[t] or not len(pick):
+            target[t] = pd.Series(dtype=float)
+        elif gate is not None and gate_mode == "slot":
+            keep = [x for x in pick if gate.loc[t, x]]
+            target[t] = pd.Series(1.0 / k, index=keep)
+        else:
+            target[t] = pd.Series(1.0 / len(pick), index=pick)
 
     rets = pd.Series(0.0, index=idx)
     turnover, w_prev, holdings = [], pd.Series(dtype=float), []
@@ -359,6 +390,8 @@ def main(argv=None):
     ap.add_argument("--freq", default="W", choices=["W", "2W", "M"])
     ap.add_argument("--regime", default="breadth", choices=["none", "breadth", "ew", "btc"])
     ap.add_argument("--fee", type=float, default=0.001, help="單邊手續費 + 滑價")
+    ap.add_argument("--trend", default="", help="各幣趨勢開關，例如 sma100 / mom60 / donch60（空字串 = 不用）")
+    ap.add_argument("--trend-mode", default="slot", choices=["slot", "filter"])
     ap.add_argument("--start", default="2020-06-01")
     ap.add_argument("--combo", action="append", help='例如 "mom_28:1,taker_14:1"，可重複給多組')
     ap.add_argument("--neutral", default="lowvol_90,liq_level",
@@ -406,7 +439,8 @@ def main(argv=None):
         if missing:
             print(f"略過 {cs}：未知因子 {missing}")
             continue
-        r, tv, hold = backtest(composite(F, U, w), P, U, dates, a.k, reg, a.fee)
+        gate = trend_signal(P, a.trend) if a.trend else None
+        r, tv, hold = backtest(composite(F, U, w), P, U, dates, a.k, reg, a.fee, gate, a.trend_mode)
         m = metrics(r)
         m["turnover_ann"] = tv.mean() * len(dates) / (len(r) / 365)
         rows.append(dict(combo=cs, **m))
@@ -414,7 +448,7 @@ def main(argv=None):
         pd.DataFrame(hold, columns=["date", "holdings"]).to_csv(
             f"{a.out}/holdings_{cs.replace(':', '').replace(',', '_')}.csv", index=False)
     res = pd.DataFrame(rows).set_index("combo")
-    print("\n" + "=" * 30, f"組合回測  top{a.k} {a.freq}  濾網={a.regime}  手續費={a.fee:.2%}", "=" * 30)
+    print("\n" + "=" * 30, f"組合回測  top{a.k} {a.freq}  濾網={a.regime}  趨勢開關={a.trend or '無'}({a.trend_mode})  手續費={a.fee:.2%}", "=" * 30)
     fmt = res.drop(columns="years").copy()
     for c in ["CAGR", "Vol", "MDD", "MonthWin"]:
         fmt[c] = fmt[c].map(lambda x: f"{x:.0%}")
