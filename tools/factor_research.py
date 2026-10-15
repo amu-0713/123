@@ -59,6 +59,7 @@ def load_panel(path):
     if not frames:
         sys.exit(f"找不到 CSV：{path}")
 
+    frames = clean(frames)
     agg = {"close": "last", "high": "max", "low": "min", "quote_volume": "sum", "taker_buy_quote": "sum"}
     daily = {s: d.resample("1D").agg(agg) for s, d in frames.items()}
     daily = {s: d[d.quote_volume > 0] for s, d in daily.items()}           # 去掉停牌日
@@ -69,6 +70,47 @@ def load_panel(path):
     # 回測計價用：停牌與下市後維持最後收盤（等同以最後價格出場），上市前保持 NaN
     P["close_ff"] = P["close"].ffill()
     return P
+
+
+EXCLUDE = {"BULL", "BEAR"}            # 舊的槓桿代幣（下載腳本的過濾抓不到沒有前綴的這兩個）
+
+
+def clean(frames, max_gap_days=7, redenom_tol=0.1):
+    """
+    1. 排除槓桿代幣
+    2. 交易中斷超過 max_gap_days 天 → 視為重新上架的不同資產，拆成 SYM、SYM~2 …（例：LUNA 崩盤後的新 LUNA）
+    3. 單日價格剛好跳 10 / 100 / 1000 倍 → 視為改面額，把之前的價格按比例調整（例：QUICK、SUN、BNX、COCOS）
+    """
+    out, log = {}, []
+    for sym, d in frames.items():
+        if sym in EXCLUDE:
+            log.append(f"排除 {sym}")
+            continue
+        d = d.sort_index()
+        dvol = d["close"].resample("1D").last().pct_change().std()
+        if dvol < 0.01:                   # 日波動 <1%：穩定幣、法幣幣、代幣化股票（例：U、KGST、SPYB）
+            log.append(f"排除 {sym}（日波動 {dvol:.2%}，非一般加密貨幣）")
+            continue
+        gaps = d.index.to_series().diff().dt.days
+        cuts = list(gaps[gaps > max_gap_days].index)
+        bounds = [0] + [d.index.get_loc(t) for t in cuts] + [len(d)]
+        segs = [d.iloc[a:b] for a, b in zip(bounds[:-1], bounds[1:])]
+        for i, seg in enumerate(segs):
+            seg = seg.copy()
+            ratio = seg["close"] / seg["close"].shift(1)
+            lg = np.log10(ratio)
+            jumps = lg[(lg.abs() >= 0.9) & ((lg - lg.round()).abs() < redenom_tol)]
+            for t, v in jumps.items():
+                k = 10.0 ** round(v)
+                seg.loc[seg.index < t, ["close", "high", "low"]] *= k
+                log.append(f"{sym} {t:%Y-%m-%d} 改面額 ×{k:g}")
+            name = sym if i == 0 else f"{sym}~{i + 1}"
+            if i:
+                log.append(f"{sym} {seg.index[0]:%Y-%m-%d} 中斷後重新上架 → {name}")
+            out[name] = seg
+    if log:
+        print("資料清洗：\n  " + "\n  ".join(log))
+    return out
 
 
 # ================================================================ 因子
