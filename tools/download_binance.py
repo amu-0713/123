@@ -5,6 +5,7 @@
 只用 Python 標準函式庫，不需要 API key。
 
 用法：
+    Colab：整段貼進一個 cell 執行，跑完會自動下載 binance_spot_1d.zip
     python download_binance.py                       # 全部 USDT 現貨、日 K，輸出到 ./data/spot/1d/
     python download_binance.py --interval 1h         # 小時 K（檔案大很多）
     python download_binance.py --symbols BTCUSDT ETHUSDT
@@ -204,7 +205,7 @@ def main():
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--keep-all", action="store_true", help="不排除穩定幣與槓桿代幣")
     ap.add_argument("--no-zip", action="store_true", help="跑完不要打包成 zip")
-    a = ap.parse_args()
+    a, _ = ap.parse_known_args()   # parse_known_args：在 Colab / Jupyter 貼上直接跑也不會報錯
 
     out_dir = os.path.join(a.out, "spot", a.interval)
     cache_root = os.path.join(a.out, "_cache")
@@ -253,6 +254,11 @@ def main():
                 p = os.path.join(out_dir, name)
                 z.write(p, os.path.relpath(os.path.abspath(p), base))
         print(f"已打包：{os.path.abspath(zip_path)}（{os.path.getsize(zip_path) / 1e6:.1f} MB）→ 上傳這個檔案即可")
+        try:                                               # 在 Colab 上自動下載到本機
+            from google.colab import files
+            files.download(zip_path)
+        except ImportError:
+            pass
 
 
 if __name__ == "__main__":
