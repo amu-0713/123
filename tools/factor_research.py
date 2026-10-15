@@ -218,8 +218,8 @@ def universe(P, top_n, min_days):
     return rank <= top_n
 
 
-def rebalance_dates(idx, freq):
-    sun = idx[idx.dayofweek == 6]
+def rebalance_dates(idx, freq, day=6):
+    sun = idx[idx.dayofweek == day]                                         # day：0=週一 … 6=週日
     if freq == "2W":
         sun = sun[::2]
     elif freq == "M":
@@ -520,6 +520,8 @@ def main(argv=None):
     ap.add_argument("--min-days", type=int, default=120, help="幣池：至少上市天數")
     ap.add_argument("--k", type=int, default=3, help="持有前 k 名")
     ap.add_argument("--freq", default="W", choices=["W", "2W", "M"])
+    ap.add_argument("--rebal-days", default="6",
+                    help="調倉星期（0=週一 … 6=週日）；多個以逗號分隔時資金平均分帳、各帳在自己的日子調倉，例如 6,3")
     ap.add_argument("--regime", default="breadth", choices=["none", "breadth", "ew", "btc"])
     ap.add_argument("--fee", type=float, default=0.001, help="單邊手續費 + 滑價")
     ap.add_argument("--trend", default="", help="各幣趨勢開關，例如 sma100 / mom60 / donch60（空字串 = 不用）")
@@ -550,7 +552,8 @@ def main(argv=None):
     P = load_panel(a.data)
     F = build_factors(P)
     U = universe(P, a.top_n, a.min_days)
-    dates = rebalance_dates(P["close"].index, a.freq)
+    rebal_days = [int(x) for x in str(a.rebal_days).split(",")]
+    dates = rebalance_dates(P["close"].index, a.freq, rebal_days[0])
     dates = dates[(dates >= pd.Timestamp(a.start, tz="UTC"))]
     dates = dates[U.reindex(dates).sum(axis=1) >= max(5, a.k + 2)]
 
@@ -598,18 +601,29 @@ def main(argv=None):
         exit_gate = P["close"] >= P["close"].rolling(a.exit_ma).mean() if a.exit_ma else None
         sc = composite(F, U, w)
         fb_ok = None
-        if a.fallback and gate is not None:
-            fb_ok = base_gate["BTC"] if a.fallback == "BTC" else pd.Series(
-                [bool(base_gate.loc[t, sc.loc[t].idxmax()]) if sc.loc[t].notna().any() else False for t in dates], index=dates)
-        r, tv, hold = backtest(sc, P, U, dates, a.k, reg, a.fee, gate, a.trend_mode, a.pool or None, exit_gate,
-                               fallback=a.fallback or None, fallback_ok=fb_ok, cooldown=a.cooldown,
-                               exit_gate_new=(P["close"] >= P["close"].rolling(a.exit_ma_new).mean()) if a.exit_ma_new else None,
-                               new_weeks=a.new_weeks if a.exit_ma_new else 0,
-                               idle_daily=idle_daily, max_w=a.max_w or None, fallback_cap=a.fallback_cap)
+        parts, tvs, hold = [], [], None
+        for day in rebal_days:                                              # 每本帳各跑一次，報酬平均（各帳資金相同）
+            dd = rebalance_dates(P["close"].index, a.freq, day)
+            dd = dd[(dd >= pd.Timestamp(a.start, tz="UTC"))]
+            dd = dd[U.reindex(dd).sum(axis=1) >= max(5, a.k + 2)]
+            if a.fallback and gate is not None:
+                fb_ok = base_gate["BTC"] if a.fallback == "BTC" else pd.Series(
+                    [bool(base_gate.loc[t, sc.loc[t].idxmax()]) if sc.loc[t].notna().any() else False for t in dd], index=dd)
+            r_d, tv_d, hold_d = backtest(sc, P, U, dd, a.k, reg, a.fee, gate, a.trend_mode, a.pool or None, exit_gate,
+                                         fallback=a.fallback or None, fallback_ok=fb_ok, cooldown=a.cooldown,
+                                         exit_gate_new=(P["close"] >= P["close"].rolling(a.exit_ma_new).mean()) if a.exit_ma_new else None,
+                                         new_weeks=a.new_weeks if a.exit_ma_new else 0,
+                                         idle_daily=idle_daily, max_w=a.max_w or None, fallback_cap=a.fallback_cap)
+            parts.append(r_d)
+            tvs.append(tv_d)
+            hold = hold_d if hold is None else hold + hold_d
+        r = pd.concat(parts, axis=1).loc[max(p.index[0] for p in parts):].fillna(0).mean(axis=1)
+        tv = pd.concat(tvs) / len(parts)
+        hold = sorted(hold, key=lambda x: x[0])
         if a.vol_target:
             r, _ = vol_target(r, dates, a.vol_target, a.vol_lookback, fee=a.fee, idle_daily=idle_daily)
         m = metrics(r)
-        m["turnover_ann"] = tv.mean() * len(dates) / (len(r) / 365)
+        m["turnover_ann"] = tv.sum() / (len(r) / 365)                         # 年換手（多本帳已依資金比例加總）
         invested = pd.Series([sum(float(x.split(":")[1]) for x in hh.split(",") if x) for _, hh in hold])
         m["cash_avg"] = 1 - invested.clip(upper=1).mean()                      # 調倉日當下的平均空手率（不含週中每日出場）
         m["all_cash_wk"] = (invested == 0).mean()                              # 全部空手的週數比例
