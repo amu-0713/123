@@ -334,7 +334,8 @@ def trend_signal(P, spec):
 
 def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", pool=None, exit_gate=None,
              entry_ok=None, fallback=None, fallback_ok=None,
-             cooldown=0, cooldown_btc=True, exit_gate_new=None, new_weeks=0):
+             cooldown=0, cooldown_btc=True, exit_gate_new=None, new_weeks=0,
+             arb_daily=None, arb_on=None, arb_cost=0.0, idle_daily=None):
     """
     gate：各幣趨勢開關（DataFrame bool）
       gate_mode="slot"   先依分數選前 k 名，趨勢不成立的那一格改持有現金（每格固定 1/k）
@@ -347,6 +348,11 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
       不放現金（該幣可能因此超過 1/k）。
     cooldown：某幣被每日出場停損後，接下來 N 個調倉日不准再買（cooldown_btc=False 時 BTC 不受限）。
     exit_gate_new / new_weeks：連續持有未滿 new_weeks 個調倉日的幣用較緊的 exit_gate_new，之後改用 exit_gate。
+    現金生息（照實際操作設計）：
+      arb_daily  套利部位的每日報酬（每 1 元套利資金，已含對沖比例）
+      arb_on     各調倉日是否開套利（bool Series）；開的話「調倉後的現金」整週放進套利部位
+      arb_cost   套利部位每變動 1 元的成本（現貨+合約手續費+滑價，雙腳合計）
+      idle_daily 未放進套利的現金（含週中停損賣出的錢）每日報酬，例如活期理財；None = 0
     """
     px = P["close_ff"]
     idx = px.index
@@ -356,6 +362,8 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
 
     rets = pd.Series(0.0, index=idx)
     turnover, w_prev, holdings = [], pd.Series(dtype=float), []
+    aon = arb_on.reindex(dates).fillna(False) if arb_on is not None else None
+    sleeve_prev = 0.0                                                       # 上一期套利部位大小
     held = set()                                                            # 上一期結束時仍持有的幣
     banned = {}                                                             # 冷卻中的幣 → 可再買的調倉序號
     age = {}                                                                # 連續持有的調倉期數
@@ -392,6 +400,16 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
         holdings.append((t, ",".join(f"{c}:{v:.2f}" for c, v in w.items())))  # 幣:權重
         seg = px.loc[t:end]
         exited = []
+        cash0 = max(0.0, 1 - w.sum())
+        sleeve = cash0 if (aon is not None and arb_daily is not None and aon.loc[t]) else 0.0
+        arb_fee = arb_cost * abs(sleeve - sleeve_prev)
+        sleeve_prev = sleeve
+        if len(seg) > 1:
+            g_arb = (1 + arb_daily.reindex(seg.index[1:]).fillna(0)).cumprod() if sleeve else None
+            g_idle = (1 + idle_daily.reindex(seg.index[1:]).fillna(0)).cumprod() if idle_daily is not None else None
+            cash_val = pd.Series(sleeve, index=seg.index[1:]) * (g_arb if g_arb is not None else 1) + \
+                pd.Series(cash0 - sleeve, index=seg.index[1:]) * (g_idle if g_idle is not None else 1)
+            cash_val = pd.concat([pd.Series([cash0], index=seg.index[:1]), cash_val])
         if len(w) and len(seg) > 1:
             rel = seg[w.index] / seg[w.index].iloc[0]                       # 期間內權重自然漂移
             age = {c: (age.get(c, 0) + 1 if c in held else 0) for c in w.index}
@@ -406,18 +424,27 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
                     off = eg.index[~eg[col].values]
                     if len(off):                                            # 當天收盤賣出，之後凍結為現金
                         d = off[0]
-                        rel.loc[rel.index > d, col] = rel.loc[d, col] * (1 - fee)
+                        frozen = rel.loc[d, col] * (1 - fee)
+                        if idle_daily is not None:                          # 停損的錢放活期到下次調倉
+                            gi = (1 + idle_daily.reindex(rel.index[rel.index > d]).fillna(0)).cumprod()
+                            rel.loc[rel.index > d, col] = frozen * gi.values
+                        else:
+                            rel.loc[rel.index > d, col] = frozen
                         exited.append(col)
                         if cooldown:
                             banned[col] = i + 1 + cooldown
-            val = (rel * w).sum(axis=1) + (1 - w.sum())
+            val = (rel * w).sum(axis=1) + cash_val
             r = val.pct_change().iloc[1:]
             rets.loc[r.index] = r.values
             w_prev = (rel.iloc[-1] * w).drop(exited) / val.iloc[-1]
+        elif len(seg) > 1:                                                  # 全部空手：只有現金部位
+            r = cash_val.pct_change().iloc[1:]
+            rets.loc[r.index] = r.values
+            w_prev = pd.Series(dtype=float)
         else:
             w_prev = pd.Series(dtype=float)
         held = set(w.index) - set(exited)
-        rets.loc[seg.index[1] if len(seg) > 1 else t] -= fee * tv
+        rets.loc[seg.index[1] if len(seg) > 1 else t] -= fee * tv + arb_fee
     rets = rets.loc[dates[0]:]
     return rets, pd.Series(turnover, index=dates), holdings
 
