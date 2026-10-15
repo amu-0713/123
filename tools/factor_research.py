@@ -336,7 +336,7 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
              entry_ok=None, fallback=None, fallback_ok=None,
              cooldown=0, cooldown_btc=True, exit_gate_new=None, new_weeks=0,
              arb_daily=None, arb_on=None, arb_cost=0.0, idle_daily=None, arb_band=0.0, size=None,
-             max_w=None, fallback_cap=False):
+             max_w=None, fallback_cap=False, lag=0):
     """
     gate：各幣趨勢開關（DataFrame bool）
       gate_mode="slot"   先依分數選前 k 名，趨勢不成立的那一格改持有現金（每格固定 1/k）
@@ -358,6 +358,7 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
     size：DataFrame（0~1），各幣每格部位的縮放倍數，例如依波動調整；None = 每格固定 1/k
     max_w：設定時改為「最多 k 檔、每檔 min(max_w, 1/檔數)」（k 當作持有上限）；
       fallback_cap=True 時補位的幣也不超過 max_w，其餘留現金
+    lag：成交延遲天數。0 = 訊號當天收盤成交；1 = 收盤算訊號、隔天收盤才成交（調倉與每日出場皆適用）
     """
     px = P["close_ff"]
     idx = px.index
@@ -407,10 +408,15 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
 
         # ---- 持有到下個調倉日
         end = dates[i + 1] if i + 1 < len(dates) else idx[-1]
+        if lag:                                                             # 延遲成交：持有區間整體往後移
+            shift = lambda d: idx[min(idx.get_loc(d) + lag, len(idx) - 1)]
+            t_exec, end = shift(t), (shift(end) if i + 1 < len(dates) else idx[-1])
+        else:
+            t_exec = t
         tv = w.subtract(w_prev, fill_value=0).abs().sum()
         turnover.append(tv)
         holdings.append((t, ",".join(f"{c}:{v:.2f}" for c, v in w.items())))  # 幣:權重
-        seg = px.loc[t:end]
+        seg = px.loc[t_exec:end]
         exited = []
         cash0 = max(0.0, 1 - w.sum())
         sleeve = cash0 if (aon is not None and arb_daily is not None and aon.loc[t]) else 0.0
@@ -436,6 +442,9 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
                             eg[col] = egn[col]
                 for col in w.index:
                     off = eg.index[~eg[col].values]
+                    if len(off) and lag:                                    # 訊號隔 lag 天才成交
+                        k_ = seg.index.get_loc(off[0]) + lag
+                        off = seg.index[k_:k_ + 1] if k_ < len(seg) - 1 else off[:0]
                     if len(off):                                            # 當天收盤賣出，之後凍結為現金
                         d = off[0]
                         frozen = rel.loc[d, col] * (1 - fee)
@@ -458,7 +467,7 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
         else:
             w_prev = pd.Series(dtype=float)
         held = set(w.index) - set(exited)
-        rets.loc[seg.index[1] if len(seg) > 1 else t] -= fee * tv + arb_fee
+        rets.loc[seg.index[1] if len(seg) > 1 else t_exec] -= fee * tv + arb_fee
     rets = rets.loc[dates[0]:]
     return rets, pd.Series(turnover, index=dates), holdings
 
