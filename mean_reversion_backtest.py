@@ -150,6 +150,23 @@ def report(tr, title):
     print(f"平均持有       {tr['bars'].mean():.1f} 根")
     print("出場原因       " + ", ".join(f"{k} {v}" for k, v in tr["reason"].value_counts().items()))
 
+    # 不開槓桿的組合績效：資金平分給每個幣，各自複利，不再平衡
+    # （權益只在出場時更新，持倉中的浮虧沒算進回撤，實際 MDD 會更大一些）
+    days = pd.date_range(tr["entry_time"].min().normalize(),
+                         tr["exit_time"].max().normalize(), freq="D")
+    sleeves = []
+    for _, g in tr.sort_values("exit_time").groupby("symbol"):
+        eq = (1 + g["ret"]).cumprod()
+        eq.index = g["exit_time"].dt.normalize()
+        eq = eq.groupby(level=0).last().reindex(days).ffill().fillna(1.0)
+        sleeves.append(eq)
+    port = pd.concat(sleeves, axis=1).mean(axis=1)
+    years = max((days[-1] - days[0]).days, 1) / 365
+    cagr = port.iloc[-1] ** (1 / years) - 1
+    mdd_port = (port / port.cummax() - 1).min()
+    print(f"組合年化(1x)   {cagr:+.1%}   MDD {mdd_port:.1%}   "
+          f"年化/MDD {cagr / -mdd_port if mdd_port < 0 else float('inf'):.2f}")
+
     # 槓桿試算：每筆用全部資金 × 槓桿，依出場時間順序複利
     # （多個幣同時持倉時這裡會高估，只當作量級參考）
     seq = tr.sort_values("exit_time")
