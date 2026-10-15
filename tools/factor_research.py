@@ -304,12 +304,14 @@ def trend_signal(P, spec):
     raise ValueError(spec)
 
 
-def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", pool=None):
+def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", pool=None, exit_gate=None):
     """
     gate：各幣趨勢開關（DataFrame bool）
       gate_mode="slot"   先依分數選前 k 名，趨勢不成立的那一格改持有現金（每格固定 1/k）
       gate_mode="filter" 只在趨勢成立的幣裡選前 k 名，資金平均分配（有幣就滿倉）
       gate_mode="fill"   只在分數前 pool 名裡，依分數順序挑趨勢成立的幣補滿 k 格（每格固定 1/k，不足的格子持有現金）
+    exit_gate：每日出場條件（DataFrame bool，False = 出場）。持有中的幣某天收盤不成立就以當天收盤賣出，
+      該格改持有現金到下個調倉日；進場仍只在調倉日。None = 只在調倉日檢查。
     """
     px = P["close_ff"]
     idx = px.index
@@ -342,12 +344,21 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
         seg = px.loc[t:end]
         if len(w) and len(seg) > 1:
             rel = seg[w.index] / seg[w.index].iloc[0]                       # 期間內權重自然漂移
+            exited = []
+            if exit_gate is not None:
+                eg = exit_gate.reindex(index=seg.index[1:], columns=w.index).fillna(True).astype(bool)
+                for col in w.index:
+                    off = eg.index[~eg[col].values]
+                    if len(off):                                            # 當天收盤賣出，之後凍結為現金
+                        d = off[0]
+                        rel.loc[rel.index > d, col] = rel.loc[d, col] * (1 - fee)
+                        exited.append(col)
             val = (rel * w).sum(axis=1)
             cash = 1 - w.sum()
             val = val + cash
             r = val.pct_change().iloc[1:]
             rets.loc[r.index] = r.values
-            w_prev = (rel.iloc[-1] * w) / val.iloc[-1]
+            w_prev = (rel.iloc[-1] * w).drop(exited) / val.iloc[-1]
         else:
             w_prev = pd.Series(dtype=float)
         rets.loc[seg.index[1] if len(seg) > 1 else t] -= fee * tv
@@ -397,6 +408,7 @@ def main(argv=None):
     ap.add_argument("--trend", default="", help="各幣趨勢開關，例如 sma100 / mom60 / donch60（空字串 = 不用）")
     ap.add_argument("--trend-mode", default="slot", choices=["slot", "filter", "fill"])
     ap.add_argument("--pool", type=int, default=0, help="fill 模式：只在分數前 N 名裡遞補")
+    ap.add_argument("--exit-ma", type=int, default=0, help="每日出場：持有中的幣收盤跌破 N 日均線就賣（0 = 只在調倉日檢查）")
     ap.add_argument("--start", default="2020-06-01")
     ap.add_argument("--combo", action="append", help='例如 "mom_28:1,taker_14:1"，可重複給多組')
     ap.add_argument("--neutral", default="lowvol_90,liq_level",
@@ -445,11 +457,12 @@ def main(argv=None):
             print(f"略過 {cs}：未知因子 {missing}")
             continue
         gate = trend_signal(P, a.trend) if a.trend else None
-        r, tv, hold = backtest(composite(F, U, w), P, U, dates, a.k, reg, a.fee, gate, a.trend_mode, a.pool or None)
+        exit_gate = P["close"] >= P["close"].rolling(a.exit_ma).mean() if a.exit_ma else None
+        r, tv, hold = backtest(composite(F, U, w), P, U, dates, a.k, reg, a.fee, gate, a.trend_mode, a.pool or None, exit_gate)
         m = metrics(r)
         m["turnover_ann"] = tv.mean() * len(dates) / (len(r) / 365)
         n_hold = pd.Series([len([x for x in hh.split(",") if x]) for _, hh in hold])
-        m["cash_avg"] = 1 - (n_hold / a.k).clip(upper=1).mean()                # 平均空手率（USDT 比例）
+        m["cash_avg"] = 1 - (n_hold / a.k).clip(upper=1).mean()                # 調倉日當下的平均空手率（不含週中每日出場）
         m["all_cash_wk"] = (n_hold == 0).mean()                                # 全部空手的週數比例
         rows.append(dict(combo=cs, **m))
         daily[cs] = r
