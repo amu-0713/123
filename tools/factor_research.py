@@ -304,7 +304,8 @@ def trend_signal(P, spec):
     raise ValueError(spec)
 
 
-def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", pool=None, exit_gate=None):
+def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", pool=None, exit_gate=None,
+             entry_ok=None, fallback=None, fallback_ok=None):
     """
     gate：各幣趨勢開關（DataFrame bool）
       gate_mode="slot"   先依分數選前 k 名，趨勢不成立的那一格改持有現金（每格固定 1/k）
@@ -312,39 +313,51 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
       gate_mode="fill"   只在分數前 pool 名裡，依分數順序挑趨勢成立的幣補滿 k 格（每格固定 1/k，不足的格子持有現金）
     exit_gate：每日出場條件（DataFrame bool，False = 出場）。持有中的幣某天收盤不成立就以當天收盤賣出，
       該格改持有現金到下個調倉日；進場仍只在調倉日。None = 只在調倉日檢查。
+    entry_ok：Series bool。調倉日為 False 時不買進新幣，只保留上一期仍持有、且仍符合條件的幣。
+    fallback："BTC" 或 "top1"（當期分數第一名）。fallback_ok 為 True 的調倉日，空出來的格子改買這個幣，
+      不放現金（該幣可能因此超過 1/k）。
     """
     px = P["close_ff"]
     idx = px.index
     on = regime.reindex(dates).fillna(False)
-    target = {}
-    for t in dates:
+    eok = entry_ok.reindex(dates).fillna(False) if entry_ok is not None else None
+    fok = fallback_ok.reindex(dates).fillna(False) if fallback_ok is not None else None
+
+    rets = pd.Series(0.0, index=idx)
+    turnover, w_prev, holdings = [], pd.Series(dtype=float), []
+    held = set()                                                            # 上一期結束時仍持有的幣
+    for i, t in enumerate(dates):
+        # ---- 決定目標權重
         s = score.loc[t].dropna()
         if gate is not None and gate_mode == "fill":
             s = s.nlargest(pool or k)
             s = s[gate.loc[t].reindex(s.index).fillna(False).astype(bool)]
         if gate is not None and gate_mode == "filter":
             s = s[gate.loc[t].reindex(s.index).fillna(False).astype(bool)]
+        if eok is not None and not eok.loc[t]:
+            s = s[s.index.isin(held)]                                       # 市場不佳：不買新幣
         pick = s.nlargest(k).index
         if not on.loc[t] or not len(pick):
-            target[t] = pd.Series(dtype=float)
+            w = pd.Series(dtype=float)
         elif gate is not None and gate_mode in ("slot", "fill"):
             keep = [x for x in pick if gate.loc[t, x]]
-            target[t] = pd.Series(1.0 / k, index=keep)
+            w = pd.Series(1.0 / k, index=keep)
         else:
-            target[t] = pd.Series(1.0 / len(pick), index=pick)
+            w = pd.Series(1.0 / len(pick), index=pick)
+        if fallback and fok is not None and fok.loc[t] and w.sum() < 1 - 1e-9:
+            fb = "BTC" if fallback == "BTC" else (score.loc[t].dropna().idxmax() if score.loc[t].notna().any() else None)
+            if fb is not None and pd.notna(px.loc[t].get(fb)):
+                w = w.add(pd.Series({fb: 1 - w.sum()}), fill_value=0)
 
-    rets = pd.Series(0.0, index=idx)
-    turnover, w_prev, holdings = [], pd.Series(dtype=float), []
-    for i, t in enumerate(dates):
+        # ---- 持有到下個調倉日
         end = dates[i + 1] if i + 1 < len(dates) else idx[-1]
-        w = target[t]
         tv = w.subtract(w_prev, fill_value=0).abs().sum()
         turnover.append(tv)
         holdings.append((t, ",".join(w.index)))
         seg = px.loc[t:end]
+        exited = []
         if len(w) and len(seg) > 1:
             rel = seg[w.index] / seg[w.index].iloc[0]                       # 期間內權重自然漂移
-            exited = []
             if exit_gate is not None:
                 eg = exit_gate.reindex(index=seg.index[1:], columns=w.index).fillna(True).astype(bool)
                 for col in w.index:
@@ -353,14 +366,13 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
                         d = off[0]
                         rel.loc[rel.index > d, col] = rel.loc[d, col] * (1 - fee)
                         exited.append(col)
-            val = (rel * w).sum(axis=1)
-            cash = 1 - w.sum()
-            val = val + cash
+            val = (rel * w).sum(axis=1) + (1 - w.sum())
             r = val.pct_change().iloc[1:]
             rets.loc[r.index] = r.values
             w_prev = (rel.iloc[-1] * w).drop(exited) / val.iloc[-1]
         else:
             w_prev = pd.Series(dtype=float)
+        held = set(w.index) - set(exited)
         rets.loc[seg.index[1] if len(seg) > 1 else t] -= fee * tv
     rets = rets.loc[dates[0]:]
     return rets, pd.Series(turnover, index=dates), holdings
@@ -408,6 +420,8 @@ def main(argv=None):
     ap.add_argument("--trend", default="", help="各幣趨勢開關，例如 sma100 / mom60 / donch60（空字串 = 不用）")
     ap.add_argument("--trend-mode", default="slot", choices=["slot", "filter", "fill"])
     ap.add_argument("--pool", type=int, default=0, help="fill 模式：只在分數前 N 名裡遞補")
+    ap.add_argument("--fallback", default="", choices=["", "BTC", "top1"],
+                    help="空格不放現金，改買此幣；條件為該幣本身也符合 --trend 趨勢開關")
     ap.add_argument("--exit-ma", type=int, default=0, help="每日出場：持有中的幣收盤跌破 N 日均線就賣（0 = 只在調倉日檢查）")
     ap.add_argument("--start", default="2020-06-01")
     ap.add_argument("--combo", action="append", help='例如 "mom_28:1,taker_14:1"，可重複給多組')
@@ -458,7 +472,13 @@ def main(argv=None):
             continue
         gate = trend_signal(P, a.trend) if a.trend else None
         exit_gate = P["close"] >= P["close"].rolling(a.exit_ma).mean() if a.exit_ma else None
-        r, tv, hold = backtest(composite(F, U, w), P, U, dates, a.k, reg, a.fee, gate, a.trend_mode, a.pool or None, exit_gate)
+        sc = composite(F, U, w)
+        fb_ok = None
+        if a.fallback and gate is not None:
+            fb_ok = gate["BTC"] if a.fallback == "BTC" else pd.Series(
+                [bool(gate.loc[t, sc.loc[t].idxmax()]) if sc.loc[t].notna().any() else False for t in dates], index=dates)
+        r, tv, hold = backtest(sc, P, U, dates, a.k, reg, a.fee, gate, a.trend_mode, a.pool or None, exit_gate,
+                               fallback=a.fallback or None, fallback_ok=fb_ok)
         m = metrics(r)
         m["turnover_ann"] = tv.mean() * len(dates) / (len(r) / 365)
         n_hold = pd.Series([len([x for x in hh.split(",") if x]) for _, hh in hold])
