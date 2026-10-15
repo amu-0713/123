@@ -353,7 +353,7 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
         end = dates[i + 1] if i + 1 < len(dates) else idx[-1]
         tv = w.subtract(w_prev, fill_value=0).abs().sum()
         turnover.append(tv)
-        holdings.append((t, ",".join(w.index)))
+        holdings.append((t, ",".join(f"{c}:{v:.2f}" for c, v in w.items())))  # 幣:權重
         seg = px.loc[t:end]
         exited = []
         if len(w) and len(seg) > 1:
@@ -481,9 +481,9 @@ def main(argv=None):
                                fallback=a.fallback or None, fallback_ok=fb_ok)
         m = metrics(r)
         m["turnover_ann"] = tv.mean() * len(dates) / (len(r) / 365)
-        n_hold = pd.Series([len([x for x in hh.split(",") if x]) for _, hh in hold])
-        m["cash_avg"] = 1 - (n_hold / a.k).clip(upper=1).mean()                # 調倉日當下的平均空手率（不含週中每日出場）
-        m["all_cash_wk"] = (n_hold == 0).mean()                                # 全部空手的週數比例
+        invested = pd.Series([sum(float(x.split(":")[1]) for x in hh.split(",") if x) for _, hh in hold])
+        m["cash_avg"] = 1 - invested.clip(upper=1).mean()                      # 調倉日當下的平均空手率（不含週中每日出場）
+        m["all_cash_wk"] = (invested == 0).mean()                              # 全部空手的週數比例
         rows.append(dict(combo=cs, **m))
         daily[cs] = r
         pd.DataFrame(hold, columns=["date", "holdings"]).to_csv(
