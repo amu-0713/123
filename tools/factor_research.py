@@ -443,6 +443,9 @@ def main(argv=None):
         r, tv, hold = backtest(composite(F, U, w), P, U, dates, a.k, reg, a.fee, gate, a.trend_mode)
         m = metrics(r)
         m["turnover_ann"] = tv.mean() * len(dates) / (len(r) / 365)
+        n_hold = pd.Series([len([x for x in hh.split(",") if x]) for _, hh in hold])
+        m["cash_avg"] = 1 - (n_hold / a.k).clip(upper=1).mean()                # 平均空手率（USDT 比例）
+        m["all_cash_wk"] = (n_hold == 0).mean()                                # 全部空手的週數比例
         rows.append(dict(combo=cs, **m))
         daily[cs] = r
         pd.DataFrame(hold, columns=["date", "holdings"]).to_csv(
@@ -450,7 +453,7 @@ def main(argv=None):
     res = pd.DataFrame(rows).set_index("combo")
     print("\n" + "=" * 30, f"組合回測  top{a.k} {a.freq}  濾網={a.regime}  趨勢開關={a.trend or '無'}({a.trend_mode})  手續費={a.fee:.2%}", "=" * 30)
     fmt = res.drop(columns="years").copy()
-    for c in ["CAGR", "Vol", "MDD", "MonthWin"]:
+    for c in ["CAGR", "Vol", "MDD", "MonthWin", "cash_avg", "all_cash_wk"]:
         fmt[c] = fmt[c].map(lambda x: f"{x:.0%}")
     print(fmt.to_string(float_format=lambda x: f"{x:.2f}"))
     print("\n--- 逐年報酬")
