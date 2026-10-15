@@ -335,7 +335,8 @@ def trend_signal(P, spec):
 def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", pool=None, exit_gate=None,
              entry_ok=None, fallback=None, fallback_ok=None,
              cooldown=0, cooldown_btc=True, exit_gate_new=None, new_weeks=0,
-             arb_daily=None, arb_on=None, arb_cost=0.0, idle_daily=None, arb_band=0.0, size=None):
+             arb_daily=None, arb_on=None, arb_cost=0.0, idle_daily=None, arb_band=0.0, size=None,
+             max_w=None, fallback_cap=False):
     """
     gate：各幣趨勢開關（DataFrame bool）
       gate_mode="slot"   先依分數選前 k 名，趨勢不成立的那一格改持有現金（每格固定 1/k）
@@ -355,6 +356,8 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
       idle_daily 未放進套利的現金（含週中停損賣出的錢）每日報酬，例如活期理財；None = 0
       arb_band   套利部位只在「目標與現有差距 > arb_band」時才加碼；現金不夠時一律減碼（降低換手成本）
     size：DataFrame（0~1），各幣每格部位的縮放倍數，例如依波動調整；None = 每格固定 1/k
+    max_w：設定時改為「最多 k 檔、每檔 min(max_w, 1/檔數)」（k 當作持有上限）；
+      fallback_cap=True 時補位的幣也不超過 max_w，其餘留現金
     """
     px = P["close_ff"]
     idx = px.index
@@ -387,7 +390,8 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
             w = pd.Series(dtype=float)
         elif gate is not None and gate_mode in ("slot", "fill"):
             keep = [x for x in pick if gate.loc[t, x]]
-            w = pd.Series(1.0 / k, index=keep)
+            per = min(max_w, 1.0 / len(keep)) if (max_w and keep) else 1.0 / k
+            w = pd.Series(per, index=keep)
         else:
             w = pd.Series(1.0 / len(pick), index=pick)
         if size is not None and len(w):
@@ -395,7 +399,11 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
         if fallback and fok is not None and fok.loc[t] and w.sum() < 1 - 1e-9 and size is None:
             fb = "BTC" if fallback == "BTC" else (score.loc[t].dropna().idxmax() if score.loc[t].notna().any() else None)
             if fb is not None and pd.notna(px.loc[t].get(fb)) and not (fb in blocked and cooldown_btc):
-                w = w.add(pd.Series({fb: 1 - w.sum()}), fill_value=0)
+                add = 1 - w.sum()
+                if fallback_cap and max_w:
+                    add = max(0.0, min(add, max_w - w.get(fb, 0.0)))
+                if add > 0:
+                    w = w.add(pd.Series({fb: add}), fill_value=0)
 
         # ---- 持有到下個調倉日
         end = dates[i + 1] if i + 1 < len(dates) else idx[-1]
@@ -511,6 +519,9 @@ def main(argv=None):
     ap.add_argument("--exit-ma-new", type=int, default=0, help="新倉出場均線：連續持有未滿 --new-weeks 週的幣用這條（0 = 不用）")
     ap.add_argument("--new-weeks", type=int, default=2)
     ap.add_argument("--cooldown", type=int, default=0, help="停損後 N 週內不再買同一個幣（0 = 不用）")
+    ap.add_argument("--max-w", type=float, default=0.0,
+                    help="設定後 --k 變成持有上限，每檔 = min(max_w, 1/檔數)；例如 --k 10 --max-w 0.2")
+    ap.add_argument("--fallback-cap", action="store_true", help="補位的幣也不超過 --max-w")
     ap.add_argument("--idle-rate", type=float, default=0.0, help="閒置 USDT 的年化收益（活期理財），例如 0.02")
     ap.add_argument("--vol-target", type=float, default=0.0, help="整體波動目標（年化），例如 0.4；0 = 不用")
     ap.add_argument("--vol-lookback", type=int, default=14)
@@ -585,7 +596,7 @@ def main(argv=None):
                                fallback=a.fallback or None, fallback_ok=fb_ok, cooldown=a.cooldown,
                                exit_gate_new=(P["close"] >= P["close"].rolling(a.exit_ma_new).mean()) if a.exit_ma_new else None,
                                new_weeks=a.new_weeks if a.exit_ma_new else 0,
-                               idle_daily=idle_daily)
+                               idle_daily=idle_daily, max_w=a.max_w or None, fallback_cap=a.fallback_cap)
         if a.vol_target:
             r, _ = vol_target(r, dates, a.vol_target, a.vol_lookback, fee=a.fee, idle_daily=idle_daily)
         m = metrics(r)
