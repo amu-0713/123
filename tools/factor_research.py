@@ -448,6 +448,8 @@ def main(argv=None):
     ap.add_argument("--trend", default="", help="各幣趨勢開關，例如 sma100 / mom60 / donch60（空字串 = 不用）")
     ap.add_argument("--trend-mode", default="slot", choices=["slot", "filter", "fill"])
     ap.add_argument("--pool", type=int, default=0, help="fill 模式：只在分數前 N 名裡遞補")
+    ap.add_argument("--rel-btc", type=int, default=0,
+                    help="相對強度：非 BTC 的幣還需「幣價/BTC」站上 N 日均線才可進場（0 = 不用）")
     ap.add_argument("--fallback", default="", choices=["", "BTC", "top1"],
                     help="空格不放現金，改買此幣；條件為該幣本身也符合 --trend 趨勢開關")
     ap.add_argument("--exit-ma", type=int, default=0, help="每日出場：持有中的幣收盤跌破 N 日均線就賣（0 = 只在調倉日檢查）")
@@ -501,12 +503,17 @@ def main(argv=None):
             print(f"略過 {cs}：{e}")
             continue
         gate = trend_signal(P, a.trend) if a.trend else None
+        base_gate = gate
+        if gate is not None and a.rel_btc and "BTC" in P["close"]:
+            rel = P["close"].div(P["close"]["BTC"], axis=0)
+            gate = gate & (rel >= rel.rolling(a.rel_btc).mean())
+            gate["BTC"] = base_gate["BTC"]
         exit_gate = P["close"] >= P["close"].rolling(a.exit_ma).mean() if a.exit_ma else None
         sc = composite(F, U, w)
         fb_ok = None
         if a.fallback and gate is not None:
-            fb_ok = gate["BTC"] if a.fallback == "BTC" else pd.Series(
-                [bool(gate.loc[t, sc.loc[t].idxmax()]) if sc.loc[t].notna().any() else False for t in dates], index=dates)
+            fb_ok = base_gate["BTC"] if a.fallback == "BTC" else pd.Series(
+                [bool(base_gate.loc[t, sc.loc[t].idxmax()]) if sc.loc[t].notna().any() else False for t in dates], index=dates)
         r, tv, hold = backtest(sc, P, U, dates, a.k, reg, a.fee, gate, a.trend_mode, a.pool or None, exit_gate,
                                fallback=a.fallback or None, fallback_ok=fb_ok)
         m = metrics(r)
