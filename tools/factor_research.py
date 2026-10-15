@@ -180,6 +180,34 @@ def build_factors(P):
     return {k: v.replace([np.inf, -np.inf], np.nan) for k, v in F.items()}
 
 
+def ensure_factor(F, P, name):
+    """
+    依名稱動態產生參數化因子（已存在就直接用）：
+      lowvol_N      N 日報酬標準差取負（越穩越高分）
+      lowdownvol_N  N 日下行波動取負
+      liq_N         log(N 日平均成交額)
+      liqmed_N      log(N 日成交額中位數)，較不受單日爆量影響
+    """
+    if name in F:
+        return F[name]
+    import re
+    m = re.fullmatch(r"(lowvol|lowdownvol|liq|liqmed)_(\d+)", name)
+    if not m:
+        raise KeyError(f"未知因子：{name}")
+    kind, n = m.group(1), int(m.group(2))
+    r = P["close"].pct_change(fill_method=None)
+    if kind == "lowvol":
+        f = -r.rolling(n, min_periods=max(5, n * 2 // 3)).std()
+    elif kind == "lowdownvol":
+        f = -r.where(r < 0, 0).rolling(n, min_periods=max(5, n * 2 // 3)).std()
+    elif kind == "liq":
+        f = np.log(P["qv"].rolling(n, min_periods=max(3, n * 2 // 3)).mean())
+    else:
+        f = np.log(P["qv"].rolling(n, min_periods=max(3, n * 2 // 3)).median())
+    F[name] = f.replace([np.inf, -np.inf], np.nan)
+    return F[name]
+
+
 # ================================================================ 幣池與調倉日
 
 def universe(P, top_n, min_days):
@@ -466,9 +494,11 @@ def main(argv=None):
     daily = {"benchmark_ew": ew}
     for cs in combos:
         w = parse_combo(cs)
-        missing = [n for n in w if n not in F]
-        if missing:
-            print(f"略過 {cs}：未知因子 {missing}")
+        try:
+            for n in w:
+                ensure_factor(F, P, n)
+        except KeyError as e:
+            print(f"略過 {cs}：{e}")
             continue
         gate = trend_signal(P, a.trend) if a.trend else None
         exit_gate = P["close"] >= P["close"].rolling(a.exit_ma).mean() if a.exit_ma else None
