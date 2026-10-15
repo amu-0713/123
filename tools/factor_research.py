@@ -116,43 +116,66 @@ def clean(frames, max_gap_days=7, redenom_tol=0.1):
 # ================================================================ 因子
 
 def build_factors(P):
-    c, qv, tbq = P["close"], P["qv"], P["tbq"]
+    """因子庫。名稱即定義的方向（例如 liq_level 越大 = 越活絡），好壞由 IC 正負判斷。"""
+    c, h, l, qv, tbq = P["close"], P["high"], P["low"], P["qv"], P["tbq"]
     r = c.pct_change(fill_method=None)
+    lp = np.log(c)
     mkt = r.mean(axis=1)
     F = {}
 
-    # --- 動能
-    for n in [7, 28, 56, 90]:
+    # ---------------- 動能
+    for n in [7, 14, 28, 56, 90, 180, 365]:
         F[f"mom_{n}"] = c.pct_change(n, fill_method=None)
     F["mom_90_skip7"] = c.shift(7) / c.shift(90) - 1
+    F["mom_365_skip28"] = c.shift(28) / c.shift(365) - 1
     F["riskadj_mom_56"] = c.pct_change(56, fill_method=None) / r.rolling(56).std()
+    beta = r.rolling(90).cov(mkt).div(mkt.rolling(90).var(), axis=0)
+    resid = r - beta.shift(1).mul(mkt, axis=0)                               # 扣掉市場 beta 後的報酬
+    for n in [28, 56, 90]:
+        F[f"resmom_{n}"] = resid.rolling(n).sum()
+    F["updays_60"] = (r > 0).astype(float).where(r.notna()).rolling(60).mean()   # 溫水煮青蛙：漲的天數比例
+    t = pd.Series(np.arange(len(c)), index=c.index, dtype=float)
+    F["trend_corr_90"] = lp.rolling(90).corr(t)                             # 價格走勢的直線程度（帶方向）
+    F["ma_dist_50"] = c / c.rolling(50).mean() - 1
+    F["ma_dist_200"] = c / c.rolling(200).mean() - 1
+    F["high_365"] = c / c.rolling(365, min_periods=120).max()               # 距一年高點
+    F["ath_ratio"] = c / c.cummax()                                         # 距歷史高點
 
-    # --- 短期反轉
-    F["rev_3"] = -c.pct_change(3, fill_method=None)
+    # ---------------- 短期反轉
+    F["ret_1"] = r
+    F["ret_3"] = c.pct_change(3, fill_method=None)
 
-    # --- 風險（低風險 = 高分）
+    # ---------------- 風險
     for n in [30, 90]:
         F[f"lowvol_{n}"] = -r.rolling(n).std()
     F["lowdownvol_60"] = -r.where(r < 0, 0).rolling(60).std()
-    cov = r.rolling(90).cov(mkt)
-    F["lowbeta_90"] = -cov.div(mkt.rolling(90).var(), axis=0)
+    F["lowbeta_90"] = -beta
+    F["lowidio_90"] = -resid.rolling(90).std()                              # 低特質波動
+    F["max_ret_30"] = r.rolling(30).max()                                   # 樂透性：單日最大漲幅
+    F["skew_90"] = r.rolling(90).skew()
+    F["range_30"] = np.log(h / l).rolling(30).mean()                        # 日內高低價差
 
-    # --- 主動買占比
+    # ---------------- 流動性 / 規模
+    F["liq_level"] = np.log(qv.rolling(30).mean())                          # 成交額（規模替代）
+    F["amihud_illiq"] = (r.abs() / qv).rolling(30).mean()
+    F["liq_trend_30_180"] = qv.rolling(30).mean() / qv.rolling(180).mean()  # 成交額長期變化
+    F["vol_growth_7_60"] = qv.rolling(7).mean() / qv.rolling(60).mean()     # 短期爆量
+    F["vol_cv_30"] = qv.rolling(30).std() / qv.rolling(30).mean()           # 成交額不穩定度
+    F["vol_rank_change"] = np.log(qv.rolling(30).mean()).rank(axis=1, pct=True).diff(28)   # 成交額排名變化
+
+    # ---------------- 量價
+    dlv = np.log(qv).diff()
+    F["pv_corr_30"] = r.rolling(30).corr(dlv)                               # 量價相關
+    F["upvol_share_30"] = qv.where(r > 0, 0).rolling(30).sum() / qv.rolling(30).sum()   # 上漲日成交額占比
+    F["vw_ret_30"] = (r * qv).rolling(30).sum() / qv.rolling(30).sum()      # 成交額加權報酬
+    F["clv_14"] = ((2 * c - h - l) / (h - l)).rolling(14).mean()            # 收盤在日內區間的位置
+    F["attention_dir"] = F["vol_growth_7_60"] * np.sign(F["mom_7"])         # 爆量配方向
+
+    # ---------------- 主動買占比
     ratio = lambda n: tbq.rolling(n).sum() / qv.rolling(n).sum()
     for n in [7, 14, 30]:
         F[f"taker_{n}"] = ratio(n)
-    F["taker_14_demean"] = ratio(14) - ratio(180)                          # 扣掉幣種自身長期水準
-    daily_ratio = tbq / qv
-    F["taker_14_z"] = (ratio(14) - ratio(180)) / daily_ratio.rolling(180).std()   # 相對自己歷史的 z 分數
-
-    # --- 長期反轉（價值替代）
-    F["ltrev_365"] = -c.pct_change(365, fill_method=None)
-    F["ath_drawdown"] = -(c / c.cummax())                                  # 距歷史高點跌越深分數越高
-
-    # --- 量能 / 規模替代
-    F["vol_growth"] = qv.rolling(7).mean() / qv.rolling(60).mean()
-    F["small_size"] = -np.log(qv.rolling(30).mean())                       # 成交額小 ≈ 小市值
-    F["illiq_amihud"] = (r.abs() / qv).rolling(30).mean()
+    F["taker_14_demean"] = ratio(14) - ratio(180)
 
     return {k: v.replace([np.inf, -np.inf], np.nan) for k, v in F.items()}
 
@@ -178,13 +201,22 @@ def rebalance_dates(idx, freq):
 
 # ================================================================ 單因子評估
 
-def evaluate_factors(F, P, U, dates, k):
+def _residualize(x, Z):
+    """x、Z 為截面 rank，回傳 x 對 Z 回歸後的殘差。"""
+    A = np.column_stack([np.ones(len(x)), Z])
+    beta, *_ = np.linalg.lstsq(A, x, rcond=None)
+    return x - A @ beta
+
+
+def evaluate_factors(F, P, U, dates, k, neutral=()):
+    """neutral：控制變數因子名稱，額外計算扣掉它們之後的 IC（看是否提供新資訊）。"""
     px = P["close_ff"]
     fwd = px.reindex(dates).shift(-1) / px.reindex(dates) - 1               # 到下一個調倉日的報酬
     rows, ic_series = [], {}
     for name, f in F.items():
         fv = f.reindex(dates).where(U.reindex(dates))
-        ics, topx, spread = [], [], []
+        nv = [F[n].reindex(dates) for n in neutral if n != name]
+        ics, nics, topx, spread = [], [], [], []
         for t in dates[:-1]:
             x, y = fv.loc[t].dropna(), fwd.loc[t]
             y = y[x.index].dropna()
@@ -192,6 +224,11 @@ def evaluate_factors(F, P, U, dates, k):
             if len(x) < max(5, k + 2):
                 continue
             ics.append((t, x.rank().corr(y.rank())))
+            if nv:
+                Z = pd.DataFrame({i: z.loc[t, x.index] for i, z in enumerate(nv)}).dropna()
+                if len(Z) >= 10:
+                    xr = _residualize(x[Z.index].rank().values, Z.rank().values)
+                    nics.append(pd.Series(xr).corr(pd.Series(y[Z.index].rank().values)))
             top = x.nlargest(k).index
             topx.append(y[top].mean() - y.mean())
             q = pd.qcut(x.rank(method="first"), 3, labels=False)
@@ -206,6 +243,7 @@ def evaluate_factors(F, P, U, dates, k):
             IC_pos=(s > 0).mean(), ICIR_ann=s.mean() / s.std() * np.sqrt(per_year),
             topk_excess_ann=np.mean(topx) * per_year, tercile_spread_ann=np.mean(spread) * per_year,
             yrs_IC_pos=f"{(s.groupby(s.index.year).mean() > 0).sum()}/{s.index.year.nunique()}",
+            **({"nIC": np.mean(nics), "nIC_t": np.mean(nics) / np.std(nics) * np.sqrt(len(nics))} if nics else {}),
         ))
     summary = pd.DataFrame(rows).set_index("factor").sort_values("IC_t", ascending=False)
     by_year = pd.DataFrame({n: s.groupby(s.index.year).mean() for n, s in ic_series.items()}).T
@@ -323,6 +361,8 @@ def main(argv=None):
     ap.add_argument("--fee", type=float, default=0.001, help="單邊手續費 + 滑價")
     ap.add_argument("--start", default="2020-06-01")
     ap.add_argument("--combo", action="append", help='例如 "mom_28:1,taker_14:1"，可重複給多組')
+    ap.add_argument("--neutral", default="lowvol_90,liq_level",
+                    help="計算中性化 IC 時要扣掉的因子（逗號分隔，空字串 = 不做）")
     ap.add_argument("--out", default="factor_out")
     a, _ = ap.parse_known_args(argv)
 
@@ -339,7 +379,7 @@ def main(argv=None):
           f"調倉 {a.freq}，共 {len(dates)} 期\n")
 
     # 1. 單因子
-    summ, by_year = evaluate_factors(F, P, U, dates, a.k)
+    summ, by_year = evaluate_factors(F, P, U, dates, a.k, [n for n in a.neutral.split(",") if n])
     print("=" * 30, "單因子（依 IC t 值排序）", "=" * 30)
     print(summ.to_string(float_format=lambda x: f"{x:.3f}"))
     print("\n--- 逐年 IC")
