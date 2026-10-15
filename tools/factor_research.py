@@ -335,7 +335,7 @@ def trend_signal(P, spec):
 def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", pool=None, exit_gate=None,
              entry_ok=None, fallback=None, fallback_ok=None,
              cooldown=0, cooldown_btc=True, exit_gate_new=None, new_weeks=0,
-             arb_daily=None, arb_on=None, arb_cost=0.0, idle_daily=None, arb_band=0.0):
+             arb_daily=None, arb_on=None, arb_cost=0.0, idle_daily=None, arb_band=0.0, size=None):
     """
     gate：各幣趨勢開關（DataFrame bool）
       gate_mode="slot"   先依分數選前 k 名，趨勢不成立的那一格改持有現金（每格固定 1/k）
@@ -354,6 +354,7 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
       arb_cost   套利部位每變動 1 元的成本（現貨+合約手續費+滑價，雙腳合計）
       idle_daily 未放進套利的現金（含週中停損賣出的錢）每日報酬，例如活期理財；None = 0
       arb_band   套利部位只在「目標與現有差距 > arb_band」時才加碼；現金不夠時一律減碼（降低換手成本）
+    size：DataFrame（0~1），各幣每格部位的縮放倍數，例如依波動調整；None = 每格固定 1/k
     """
     px = P["close_ff"]
     idx = px.index
@@ -389,7 +390,9 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
             w = pd.Series(1.0 / k, index=keep)
         else:
             w = pd.Series(1.0 / len(pick), index=pick)
-        if fallback and fok is not None and fok.loc[t] and w.sum() < 1 - 1e-9:
+        if size is not None and len(w):
+            w = w * size.loc[t].reindex(w.index).fillna(1).clip(0, 1)
+        if fallback and fok is not None and fok.loc[t] and w.sum() < 1 - 1e-9 and size is None:
             fb = "BTC" if fallback == "BTC" else (score.loc[t].dropna().idxmax() if score.loc[t].notna().any() else None)
             if fb is not None and pd.notna(px.loc[t].get(fb)) and not (fb in blocked and cooldown_btc):
                 w = w.add(pd.Series({fb: 1 - w.sum()}), fill_value=0)
@@ -452,6 +455,17 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
     return rets, pd.Series(turnover, index=dates), holdings
 
 
+def vol_target(r, dates, target, lookback=14, cap=1.0, fee=0.001, idle_daily=None):
+    """
+    整體波動目標：每個調倉日依策略自身近 lookback 日的實際年化波動，把總部位縮放成
+    min(cap, target / 實際波動)，隔天生效；未投入部分賺 idle_daily。部位縮放的變動計手續費。
+    """
+    rv = r.rolling(lookback).std() * np.sqrt(365)
+    s = (target / rv).clip(upper=cap).reindex(dates).reindex(r.index).ffill().shift(1).fillna(1)
+    idle = idle_daily.reindex(r.index).fillna(0) if idle_daily is not None else 0.0
+    return s * r + (1 - s) * idle - s.diff().abs().fillna(0) * fee, s
+
+
 def metrics(r, ann=365):
     eq = (1 + r).cumprod()
     yrs = len(r) / ann
@@ -497,6 +511,9 @@ def main(argv=None):
     ap.add_argument("--exit-ma-new", type=int, default=0, help="新倉出場均線：連續持有未滿 --new-weeks 週的幣用這條（0 = 不用）")
     ap.add_argument("--new-weeks", type=int, default=2)
     ap.add_argument("--cooldown", type=int, default=0, help="停損後 N 週內不再買同一個幣（0 = 不用）")
+    ap.add_argument("--idle-rate", type=float, default=0.0, help="閒置 USDT 的年化收益（活期理財），例如 0.02")
+    ap.add_argument("--vol-target", type=float, default=0.0, help="整體波動目標（年化），例如 0.4；0 = 不用")
+    ap.add_argument("--vol-lookback", type=int, default=14)
     ap.add_argument("--rel-btc", type=int, default=0,
                     help="相對強度：非 BTC 的幣還需「幣價/BTC」站上 N 日均線才可進場（0 = 不用）")
     ap.add_argument("--fallback", default="", choices=["", "BTC", "top1"],
@@ -540,6 +557,7 @@ def main(argv=None):
     # 3. 組合回測
     combos = a.combo or DEFAULT_COMBOS
     reg = regime_filter(P, U, a.regime)
+    idle_daily = pd.Series(a.idle_rate / 365, index=P["close"].index) if a.idle_rate else None
     ew = P["close_ff"].pct_change().where(U.shift(1, fill_value=False)).mean(axis=1).fillna(0).loc[dates[0]:]
     rows = [dict(combo=f"[基準] 幣池等權持有", **metrics(ew))]
     daily = {"benchmark_ew": ew}
@@ -566,7 +584,10 @@ def main(argv=None):
         r, tv, hold = backtest(sc, P, U, dates, a.k, reg, a.fee, gate, a.trend_mode, a.pool or None, exit_gate,
                                fallback=a.fallback or None, fallback_ok=fb_ok, cooldown=a.cooldown,
                                exit_gate_new=(P["close"] >= P["close"].rolling(a.exit_ma_new).mean()) if a.exit_ma_new else None,
-                               new_weeks=a.new_weeks if a.exit_ma_new else 0)
+                               new_weeks=a.new_weeks if a.exit_ma_new else 0,
+                               idle_daily=idle_daily)
+        if a.vol_target:
+            r, _ = vol_target(r, dates, a.vol_target, a.vol_lookback, fee=a.fee, idle_daily=idle_daily)
         m = metrics(r)
         m["turnover_ann"] = tv.mean() * len(dates) / (len(r) / 365)
         invested = pd.Series([sum(float(x.split(":")[1]) for x in hh.split(",") if x) for _, hh in hold])
