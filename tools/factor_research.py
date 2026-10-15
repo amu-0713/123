@@ -335,7 +335,7 @@ def trend_signal(P, spec):
 def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", pool=None, exit_gate=None,
              entry_ok=None, fallback=None, fallback_ok=None,
              cooldown=0, cooldown_btc=True, exit_gate_new=None, new_weeks=0,
-             arb_daily=None, arb_on=None, arb_cost=0.0, idle_daily=None):
+             arb_daily=None, arb_on=None, arb_cost=0.0, idle_daily=None, arb_band=0.0):
     """
     gate：各幣趨勢開關（DataFrame bool）
       gate_mode="slot"   先依分數選前 k 名，趨勢不成立的那一格改持有現金（每格固定 1/k）
@@ -353,6 +353,7 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
       arb_on     各調倉日是否開套利（bool Series）；開的話「調倉後的現金」整週放進套利部位
       arb_cost   套利部位每變動 1 元的成本（現貨+合約手續費+滑價，雙腳合計）
       idle_daily 未放進套利的現金（含週中停損賣出的錢）每日報酬，例如活期理財；None = 0
+      arb_band   套利部位只在「目標與現有差距 > arb_band」時才加碼；現金不夠時一律減碼（降低換手成本）
     """
     px = P["close_ff"]
     idx = px.index
@@ -402,6 +403,8 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
         exited = []
         cash0 = max(0.0, 1 - w.sum())
         sleeve = cash0 if (aon is not None and arb_daily is not None and aon.loc[t]) else 0.0
+        if arb_band and sleeve > 0 and sleeve_prev > 0 and sleeve - sleeve_prev < arb_band:
+            sleeve = min(sleeve_prev, cash0)                                # 差距不大就不加碼
         arb_fee = arb_cost * abs(sleeve - sleeve_prev)
         sleeve_prev = sleeve
         if len(seg) > 1:
