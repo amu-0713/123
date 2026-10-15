@@ -58,8 +58,13 @@ def load_panel(path):
             read(f, f)
     if not frames:
         sys.exit(f"找不到 CSV：{path}")
+    return build_panel(frames)
 
-    frames = clean(frames)
+
+def build_panel(frames, verbose=True):
+    """frames：{幣名: DataFrame(index=open_time, high, low, close, quote_volume, taker_buy_quote)} → 日線面板。
+    回測與實盤共用，確保兩邊的資料處理完全一致。"""
+    frames = clean(frames, verbose=verbose)
     agg = {"close": "last", "high": "max", "low": "min", "quote_volume": "sum", "taker_buy_quote": "sum"}
     daily = {s: d.resample("1D").agg(agg) for s, d in frames.items()}
     daily = {s: d[d.quote_volume > 0] for s, d in daily.items()}           # 去掉停牌日
@@ -75,7 +80,7 @@ def load_panel(path):
 EXCLUDE = {"BULL", "BEAR"}            # 舊的槓桿代幣（下載腳本的過濾抓不到沒有前綴的這兩個）
 
 
-def clean(frames, max_gap_days=7, redenom_tol=0.1):
+def clean(frames, max_gap_days=7, redenom_tol=0.1, verbose=True):
     """
     1. 排除槓桿代幣
     2. 交易中斷超過 max_gap_days 天 → 視為重新上架的不同資產，拆成 SYM、SYM~2 …（例：LUNA 崩盤後的新 LUNA）
@@ -108,7 +113,7 @@ def clean(frames, max_gap_days=7, redenom_tol=0.1):
             if i:
                 log.append(f"{sym} {seg.index[0]:%Y-%m-%d} 中斷後重新上架 → {name}")
             out[name] = seg
-    if log:
+    if log and verbose:
         print("資料清洗：\n  " + "\n  ".join(log))
     return out
 

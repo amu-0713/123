@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 data/_cache/
+bot/state_*.json
+bot/state_*.json.tmp
+bot/logs/
+bot/STOP
