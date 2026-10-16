@@ -341,7 +341,7 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
              entry_ok=None, fallback=None, fallback_ok=None,
              cooldown=0, cooldown_btc=True, exit_gate_new=None, new_weeks=0,
              arb_daily=None, arb_on=None, arb_cost=0.0, idle_daily=None, arb_band=0.0, size=None,
-             max_w=None, fallback_cap=False, lag=0):
+             max_w=None, fallback_cap=False, lag=0, min_trade=0.0):
     """
     gate：各幣趨勢開關（DataFrame bool）
       gate_mode="slot"   先依分數選前 k 名，趨勢不成立的那一格改持有現金（每格固定 1/k）
@@ -364,6 +364,7 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
     max_w：設定時改為「最多 k 檔、每檔 min(max_w, 1/檔數)」（k 當作持有上限）；
       fallback_cap=True 時補位的幣也不超過 max_w，其餘留現金
     lag：成交延遲天數。0 = 訊號當天收盤成交；1 = 收盤算訊號、隔天收盤才成交（調倉與每日出場皆適用）
+    min_trade：續抱的幣，目標權重與目前（漂移後）權重相差小於此值就不調整（新買進、全部賣出照常）
     """
     px = P["close_ff"]
     idx = px.index
@@ -411,6 +412,10 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
                 if add > 0:
                     w = w.add(pd.Series({fb: add}), fill_value=0)
 
+        if min_trade and len(w) and len(w_prev):                         # 小額差異不調整，省手續費
+            for c in w.index.intersection(w_prev.index):
+                if abs(w[c] - w_prev[c]) < min_trade:
+                    w[c] = w_prev[c]
         # ---- 持有到下個調倉日
         end = dates[i + 1] if i + 1 < len(dates) else idx[-1]
         if lag:                                                             # 延遲成交：持有區間整體往後移
@@ -477,13 +482,22 @@ def backtest(score, P, U, dates, k, regime, fee, gate=None, gate_mode="slot", po
     return rets, pd.Series(turnover, index=dates), holdings
 
 
-def vol_target(r, dates, target, lookback=14, cap=1.0, fee=0.001, idle_daily=None):
+def vol_target(r, dates, target, lookback=14, cap=1.0, fee=0.001, idle_daily=None, band=0.0):
     """
     整體波動目標：每個調倉日依策略自身近 lookback 日的實際年化波動，把總部位縮放成
     min(cap, target / 實際波動)，隔天生效；未投入部分賺 idle_daily。部位縮放的變動計手續費。
+    band：新比例與目前比例相差小於 band 時不調整（回到 100% 時一律調整）。
     """
     rv = r.rolling(lookback).std() * np.sqrt(365)
-    s = (target / rv).clip(upper=cap).reindex(dates).reindex(r.index).ffill().shift(1).fillna(1)
+    sd = (target / rv).clip(upper=cap).reindex(dates)
+    if band:                                                                # 縮放比例變動小於 band 就維持原值
+        cur, out = None, []
+        for v in sd.values:
+            if cur is None or np.isnan(cur) or (not np.isnan(v) and abs(v - cur) >= band) or (v >= cap and cur < cap):
+                cur = v
+            out.append(cur)
+        sd = pd.Series(out, index=sd.index)
+    s = sd.reindex(r.index).ffill().shift(1).fillna(1)
     idle = idle_daily.reindex(r.index).fillna(0) if idle_daily is not None else 0.0
     return s * r + (1 - s) * idle - s.diff().abs().fillna(0) * fee, s
 
@@ -541,6 +555,8 @@ def main(argv=None):
     ap.add_argument("--idle-rate", type=float, default=0.0, help="閒置 USDT 的年化收益（活期理財），例如 0.02")
     ap.add_argument("--vol-target", type=float, default=0.0, help="整體波動目標（年化），例如 0.4；0 = 不用")
     ap.add_argument("--vol-lookback", type=int, default=14)
+    ap.add_argument("--vol-band", type=float, default=0.0, help="波動縮放比例變動小於此值就不調整")
+    ap.add_argument("--min-trade", type=float, default=0.0, help="續抱部位權重差小於此值就不調整")
     ap.add_argument("--rel-btc", type=int, default=0,
                     help="相對強度：非 BTC 的幣還需「幣價/BTC」站上 N 日均線才可進場（0 = 不用）")
     ap.add_argument("--fallback", default="", choices=["", "BTC", "top1"],
@@ -618,7 +634,8 @@ def main(argv=None):
                                          fallback=a.fallback or None, fallback_ok=fb_ok, cooldown=a.cooldown,
                                          exit_gate_new=(P["close"] >= P["close"].rolling(a.exit_ma_new).mean()) if a.exit_ma_new else None,
                                          new_weeks=a.new_weeks if a.exit_ma_new else 0,
-                                         idle_daily=idle_daily, max_w=a.max_w or None, fallback_cap=a.fallback_cap)
+                                         idle_daily=idle_daily, max_w=a.max_w or None, fallback_cap=a.fallback_cap,
+                                         min_trade=a.min_trade)
             parts.append(r_d)
             tvs.append(tv_d)
             hold = hold_d if hold is None else hold + hold_d
@@ -626,7 +643,7 @@ def main(argv=None):
         tv = pd.concat(tvs) / len(parts)
         hold = sorted(hold, key=lambda x: x[0])
         if a.vol_target:
-            r, _ = vol_target(r, dates, a.vol_target, a.vol_lookback, fee=a.fee, idle_daily=idle_daily)
+            r, _ = vol_target(r, dates, a.vol_target, a.vol_lookback, fee=a.fee, idle_daily=idle_daily, band=a.vol_band)
         m = metrics(r)
         m["turnover_ann"] = tv.sum() / (len(r) / 365)                         # 年換手（多本帳已依資金比例加總）
         invested = pd.Series([sum(float(x.split(":")[1]) for x in hh.split(",") if x) for _, hh in hold])
