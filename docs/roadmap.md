@@ -2,6 +2,13 @@
 
 不標示實際日期，長度只代表相對時間；每一階段以「完成條件」為準，達成才進入下一階段。
 
+![上線路線圖](roadmap.png)
+
+由左到右依序進行；箭頭表示「前一步完成後才進入下一步」；◆ 為驗收點。
+圖由 `python tools/plot_roadmap.py` 產生。
+
+<details><summary>Mermaid 版本（GitHub 可直接顯示）</summary>
+
 ```mermaid
 gantt
     dateFormat  YYYY-MM-DD
@@ -40,6 +47,8 @@ gantt
     檢查停止條件（持續）               :f3, after d2, 62w
     每年再平衡回 70 / 30               :milestone, m4, after e3, 0d
 ```
+
+</details>
 
 ## 各階段完成條件
 
