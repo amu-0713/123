@@ -135,6 +135,20 @@ def test_reconcile_baseline():
     assert abs(sum(L["usdt"] for L in st["ledgers"].values()) - 1010) < 1e-9
 
 
+def test_backup_state():
+    import json, tempfile
+    with tempfile.TemporaryDirectory() as d:
+        sp, lp, bd = os.path.join(d, "state_live.json"), os.path.join(d, "x_live.log"), os.path.join(d, "bk")
+        json.dump({"a": 1}, open(sp, "w"))
+        open(lp, "w").write("log")
+        for day in ["2026-01-01", "2026-01-02", "2026-01-03"]:
+            runner.backup_state(sp, lp, bd, day, keep=2, log=lambda m: None)
+        assert json.load(open(os.path.join(bd, "state_live.json"))) == {"a": 1}
+        assert sorted(os.listdir(os.path.join(bd, "history"))) == ["state_live_2026-01-02.json", "state_live_2026-01-03.json"]
+        assert os.path.exists(os.path.join(bd, "x_live.log"))
+        runner.backup_state(sp, lp, lp, "2026-01-04", log=lambda m: None)   # 備份路徑錯誤只警告
+
+
 if __name__ == "__main__":
     n = 0
     for name, f in list(globals().items()):

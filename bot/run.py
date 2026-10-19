@@ -16,11 +16,14 @@
   - 同一根日 K 只會處理一次（state.last_t），重複執行不會重複下單；--force 可強制重跑
   - bot 資料夾下有 STOP 檔案時直接結束（緊急停止）
   - 實盤每次執行前先對帳：以實際餘額修正兩本帳（活期利息、手續費誤差）
+  - --backup-dir（或環境變數 BOT_BACKUP_DIR）：每次存檔後把狀態檔與紀錄複製一份過去，
+    建議指向 OneDrive / Google 雲端硬碟資料夾，電腦壞掉時可在另一台機器接著跑
 """
 import argparse
 import datetime as dt
 import json
 import os
+import shutil
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
@@ -164,6 +167,24 @@ def run_once(client, state, mode, now, capital=None, idle_rate=0.02, fee=0.001, 
     return state
 
 
+def backup_state(state_path, log_path, backup_dir, today, keep=90, log=print):
+    """複製狀態檔（最新一份 + 依日期的歷史）與當天紀錄到備份資料夾；失敗只警告，不影響交易。"""
+    try:
+        hist = os.path.join(backup_dir, "history")
+        os.makedirs(hist, exist_ok=True)
+        name = os.path.basename(state_path)
+        shutil.copy2(state_path, os.path.join(backup_dir, name))
+        shutil.copy2(state_path, os.path.join(hist, f"{name[:-5]}_{today}.json"))
+        if os.path.exists(log_path):
+            shutil.copy2(log_path, os.path.join(backup_dir, os.path.basename(log_path)))
+        old = sorted(f for f in os.listdir(hist) if f.startswith(name[:-5] + "_"))
+        for f in old[:-keep]:
+            os.remove(os.path.join(hist, f))
+        log(f"已備份到 {backup_dir}")
+    except OSError as e:
+        log(f"⚠️ 備份失敗（交易不受影響）：{e}")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mode", choices=["paper", "dry", "live"], default="paper")
@@ -171,6 +192,8 @@ def main(argv=None):
     ap.add_argument("--capital", type=float, default=None, help="第一次執行時投入的 USDT")
     ap.add_argument("--idle-rate", type=float, default=0.02, help="紙上交易的活期年化利率假設")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--backup-dir", default=os.environ.get("BOT_BACKUP_DIR"),
+                    help="每次存檔後複製狀態檔與紀錄到這個資料夾（例如雲端硬碟）")
     a, _ = ap.parse_known_args(argv)
 
     if os.path.exists(os.path.join(HERE, "STOP")):
@@ -209,6 +232,8 @@ def main(argv=None):
             json.dump(state, f, ensure_ascii=False, indent=1)
         os.replace(tmp, state_path)
         log(f"狀態已存：{state_path}")
+        if a.backup_dir:
+            backup_state(state_path, log_path, a.backup_dir, f"{dt.datetime.utcnow():%Y-%m-%d}", log=log)
     logf.close()
 
 
