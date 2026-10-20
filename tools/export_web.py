@@ -2,11 +2,18 @@
 匯出網站用的 JSON（給 my-stock-rank 網站的「加密貨幣」頁面）。
 
 用法：
-  python tools/export_web.py --data <download_binance.py 輸出的 data/spot/1d> --out <網站 repo>/public/crypto
+  # 完整重算（需要 download_binance.py 下載的完整歷史）
+  python tools/export_web.py --data <data/spot/1d> --out <網站 repo>/public/crypto
+  # 每日增量更新（網站 repo 的 GitHub Actions 使用）：從幣安公開行情抓最近的日 K，
+  # 只把新的日子接到既有的 daily_nav.json 後面，不需要 2018 年起的完整資料
+  python tools/export_web.py --update --out <網站 repo>/public/crypto
 
 輸出：
   summary.json    績效指標、逐年報酬、淨值與回撤（週取樣）、最近一次調倉持倉
-  daily_nav.json  [[日期, 淨值], ...]，日期為日 K 收盤當天（UTC 00:00 = 台灣 08:00），給混合配置頁使用
+  daily_nav.json  [[日期, 策略淨值, BTC 淨值], ...]，日期為日 K 收盤當天（UTC 00:00 = 台灣 08:00），給混合配置頁使用
+
+增量更新的依據：策略指標最長只回看約 120 天，用最近一段資料重算，與用完整歷史算出的日報酬相同
+（實測最近 60 天差異為 0）；只需留一段暖機期讓持倉狀態收斂。
 
 只輸出報酬率與淨值指數，不含任何帳戶金額。
 """
@@ -24,13 +31,17 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import factor_research as fr  # noqa: E402
 
+PUBLIC_API = "https://data-api.binance.vision"   # 幣安公開行情（不需要 API key，GitHub Actions 的美國主機也能連）
+WARMUP_DAYS = 130                                  # 增量更新時，資料起點之後先暖機的天數（指標回看 + 上市天數）
+OVERLAP_DAYS = 60                                  # 增量更新時，重算區間與既有資料重疊的天數（用來檢查一致）
+
 # 與 docs/strategy.md 最終設定相同
 CFG = dict(top_n=100, min_days=120, k=5, pool=20, high_n=60, high_th=0.9, rel_btc=30, exit_old=40, exit_new=20,
            new_weeks=2, combo={"lowvol_30": 0.5, "liq_30": 0.5}, vt=0.4, vt_lb=14, fee=0.001, idle=0.02,
            days=(6, 3), start="2018-06-01")
 
 
-def run_strategy(P):
+def run_strategy(P, start=None):
     c = P["close"]
     idx = c.index
     U = fr.universe(P, CFG["top_n"], CFG["min_days"])
@@ -44,7 +55,7 @@ def run_strategy(P):
     gate["BTC"] = g0["BTC"]
     ma = lambda n: c >= c.rolling(n).mean()
     idle = pd.Series(CFG["idle"] / 365, index=idx)
-    start = pd.Timestamp(CFG["start"], tz="UTC")
+    start = pd.Timestamp(start or CFG["start"], tz="UTC")
     parts, ledgers, first_dates = [], {}, None
     for name, wd in zip("AB", CFG["days"]):
         d0 = idx[idx.dayofweek == wd]
@@ -65,19 +76,13 @@ def pct(x, nd=2):
     return None if x is None or not np.isfinite(x) else round(float(x) * 100, nd)
 
 
-def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--data", required=True)
-    ap.add_argument("--out", required=True)
-    a = ap.parse_args(argv)
+def close_date(ix):
+    """日 K 的開盤時間（UTC）→ 收盤當天的日期字串"""
+    return (ix + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
 
-    with contextlib.redirect_stdout(io.StringIO()):
-        P = fr.load_panel(a.data)
-    r, ledgers, scale = run_strategy(P)
-    r = r.iloc[:-1]                                                         # 最後一根可能是未收盤的日 K
-    btc = P["close_ff"]["BTC"].pct_change().reindex(r.index).fillna(0)
-    close_date = lambda ix: (ix + pd.Timedelta(days=1)).strftime("%Y-%m-%d")  # 日 K 收盤的日期
 
+def write_outputs(out, r, btc, ledgers, exposure):
+    """r、btc：每日報酬（index 為日 K 開盤時間）"""
     eq, eq_b = (1 + r).cumprod(), (1 + btc).cumprod()
     dd, dd_b = eq / eq.cummax() - 1, eq_b / eq_b.cummax() - 1
     m, mb = fr.metrics(r), fr.metrics(btc)
@@ -101,22 +106,79 @@ def main(argv=None):
                                          for x in s.split(",") if x])
     summary = dict(
         generated_at=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-        start_date=close_date(r.index[:1])[0], end_date=close_date(r.index[-1:])[0],
+        start_date=close_date(r.index[0]), end_date=close_date(r.index[-1]),
         method_note="2018-06 起回測。幣池包含已下市的幣，以避免倖存者偏差；已計入手續費與滑價，閒置資金計入活期收益。"
                     "此為歷史回測，不代表未來報酬。",
         metrics=dict(strategy=metric_block(m), btc=metric_block(mb)),
         yearly=[dict(year=int(y), strategy=pct(ys[y], 1), btc=pct(yb[y], 1)) for y in ys.index],
         curve=curve,
         holdings=holdings,
-        exposure_now=round(float(scale.dropna().iloc[-1]) * 100, 1) if scale.notna().any() else None,
+        exposure_now=exposure,
     )
-    os.makedirs(a.out, exist_ok=True)
-    with open(os.path.join(a.out, "summary.json"), "w", encoding="utf-8") as f:
+    os.makedirs(out, exist_ok=True)
+    with open(os.path.join(out, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, separators=(",", ":"))
-    nav = [[d, round(float(v), 6)] for d, v in zip(close_date(eq.index), eq.values)]
-    with open(os.path.join(a.out, "daily_nav.json"), "w", encoding="utf-8") as f:
+    nav = [[close_date(t), round(float(a), 8), round(float(b), 8)] for t, a, b in zip(eq.index, eq.values, eq_b.values)]
+    with open(os.path.join(out, "daily_nav.json"), "w", encoding="utf-8") as f:
         json.dump(nav, f, separators=(",", ":"))
-    print(f"已輸出 {a.out}：{summary['start_date']} ~ {summary['end_date']}，年化 {summary['metrics']['strategy']['cagr']}%")
+    return summary
+
+
+def load_returns(out):
+    """讀既有的 daily_nav.json，還原成每日報酬（index 為日 K 開盤時間）"""
+    with open(os.path.join(out, "daily_nav.json"), encoding="utf-8") as f:
+        rows = json.load(f)
+    ix = pd.to_datetime([r[0] for r in rows], utc=True) - pd.Timedelta(days=1)
+    nav = pd.DataFrame([r[1:3] for r in rows], index=ix, columns=["strategy", "btc"])
+    ret = nav.pct_change()
+    ret.iloc[0] = nav.iloc[0] - 1
+    return ret["strategy"], ret["btc"]
+
+
+def fetch_recent_panel():
+    """從幣安公開行情抓所有交易中 USDT 現貨的近期日 K（與 bot 相同的抓法與資料處理）"""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bot"))
+    from binance_api import Client  # noqa: E402
+    from run import fetch_panel  # noqa: E402
+    P, t, _ = fetch_panel(Client(base=PUBLIC_API), pd.Timestamp.now(tz="UTC"))
+    return P, t
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--data", help="完整歷史資料（完整重算用）")
+    ap.add_argument("--update", action="store_true", help="增量更新：抓近期日 K，把新的日子接到既有資料後面")
+    ap.add_argument("--out", required=True)
+    a = ap.parse_args(argv)
+
+    if a.update:
+        r_old, btc_old = load_returns(a.out)
+        P, t = fetch_recent_panel()
+        start = max(P["close"].index[0] + pd.Timedelta(days=WARMUP_DAYS), r_old.index[-1] - pd.Timedelta(days=OVERLAP_DAYS + 60))
+        r_new, ledgers, scale = run_strategy(P, start=start.strftime("%Y-%m-%d"))
+        btc_new = P["close_ff"]["BTC"].pct_change().reindex(r_new.index).fillna(0)
+        chk = pd.concat([r_old, r_new], axis=1, join="inner").iloc[-OVERLAP_DAYS:]
+        gap = (chk.iloc[:, 0] - chk.iloc[:, 1]).abs().max()
+        print(f"與既有資料重疊 {len(chk)} 天，日報酬最大差異 {gap:.2e}")
+        add = r_new.index[r_new.index > r_old.index[-1]]
+        if not len(add):
+            print(f"沒有新的日 K（既有資料到 {close_date(r_old.index[-1])}，最新已收盤 {close_date(t)}）")
+            return
+        r = pd.concat([r_old, r_new.loc[add]])
+        btc = pd.concat([btc_old, btc_new.loc[add]])
+    else:
+        if not a.data:
+            ap.error("完整重算需要 --data")
+        with contextlib.redirect_stdout(io.StringIO()):
+            P = fr.load_panel(a.data)
+        r, ledgers, scale = run_strategy(P)
+        r = r.iloc[:-1]                                                     # 最後一根可能是未收盤的日 K
+        btc = P["close_ff"]["BTC"].pct_change().reindex(r.index).fillna(0)
+        add = r.index
+    exposure = round(float(scale.dropna().iloc[-1]) * 100, 1) if scale.notna().any() else None
+    summary = write_outputs(a.out, r, btc, ledgers, exposure)
+    print(f"已輸出 {a.out}：{summary['start_date']} ~ {summary['end_date']}（新增 {len(add)} 天），"
+          f"年化 {summary['metrics']['strategy']['cagr']}%")
 
 
 if __name__ == "__main__":
