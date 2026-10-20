@@ -102,8 +102,8 @@ def main(argv=None):
     summary = dict(
         generated_at=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         start_date=close_date(r.index[:1])[0], end_date=close_date(r.index[-1:])[0],
-        method_note="2018-06 起回測。幣安 USDT 現貨成交額前 100 名（含已下市幣），單邊手續費加滑價 0.1%，"
-                    "閒置資金年化 2%。兩本帳（週日、週四）錯開調倉，40% 波動目標。此為歷史回測，不代表未來報酬。",
+        method_note="2018-06 起回測。幣池包含已下市的幣，以避免倖存者偏差；已計入手續費與滑價，閒置資金計入活期收益。"
+                    "此為歷史回測，不代表未來報酬。",
         metrics=dict(strategy=metric_block(m), btc=metric_block(mb)),
         yearly=[dict(year=int(y), strategy=pct(ys[y], 1), btc=pct(yb[y], 1)) for y in ys.index],
         curve=curve,
