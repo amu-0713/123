@@ -67,7 +67,7 @@ def fetch_panel(client, now, extra_coins=(), log=print, workers=8):
 
     with ThreadPoolExecutor(workers) as ex:
         frames = {s[:-4]: d for s, d in ex.map(one, syms) if d is not None and len(d)}
-    P = fr.build_panel(frames, verbose=False)
+    P = fr.build_panel(frames, verbose=False, window_start=today - pd.Timedelta(days=engine.HISTORY_DAYS))
     t = P["close"].index.max()
     if t != today - pd.Timedelta(days=1):
         log(f"  注意：最新已收盤日 K 為 {t.date()}，不是昨天 {(today - pd.Timedelta(days=1)).date()}")

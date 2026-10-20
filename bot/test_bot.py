@@ -9,6 +9,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "tools"))
 import engine  # noqa: E402
+import factor_research as fr  # noqa: E402
 from binance_api import floor_step, symbol_rules  # noqa: E402
 from brokers import LiveBroker, PaperBroker  # noqa: E402
 import run as runner  # noqa: E402
@@ -147,6 +148,16 @@ def test_backup_state():
         assert sorted(os.listdir(os.path.join(bd, "history"))) == ["state_live_2026-01-02.json", "state_live_2026-01-03.json"]
         assert os.path.exists(os.path.join(bd, "x_live.log"))
         runner.backup_state(sp, lp, lp, "2026-01-04", log=lambda m: None)   # 備份路徑錯誤只警告
+
+
+def test_non_crypto_filter():
+    ts = lambda d: pd.Timestamp(d, tz="UTC")
+    assert fr.is_non_crypto("XAUT", ts("2026-03-26")) and fr.is_non_crypto("SPCXB", ts("2026-06-12"))
+    assert fr.is_non_crypto("NEWSTOCKB", ts("2026-09-01"))                        # 名單外、新上架、B 結尾
+    assert not fr.is_non_crypto("BNB", ts("2017-11-06")) and not fr.is_non_crypto("ARB", ts("2023-03-23"))
+    w = ts("2027-06-01")                                                           # 實盤只抓最近一段：老幣從抓取起點開始
+    assert not fr.is_non_crypto("BNB", w, window_start=w)
+    assert fr.is_non_crypto("NEWSTOCKB", ts("2027-09-01"), window_start=w)
 
 
 if __name__ == "__main__":

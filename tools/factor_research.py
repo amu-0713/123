@@ -61,10 +61,10 @@ def load_panel(path):
     return build_panel(frames)
 
 
-def build_panel(frames, verbose=True):
+def build_panel(frames, verbose=True, window_start=None):
     """frames：{幣名: DataFrame(index=open_time, high, low, close, quote_volume, taker_buy_quote)} → 日線面板。
-    回測與實盤共用，確保兩邊的資料處理完全一致。"""
-    frames = clean(frames, verbose=verbose)
+    回測與實盤共用，確保兩邊的資料處理完全一致。window_start：實盤只抓最近一段資料時的抓取起點（見 is_non_crypto）。"""
+    frames = clean(frames, verbose=verbose, window_start=window_start)
     agg = {"close": "last", "high": "max", "low": "min", "quote_volume": "sum", "taker_buy_quote": "sum"}
     daily = {s: d.resample("1D").agg(agg) for s, d in frames.items()}
     daily = {s: d[d.quote_volume > 0] for s, d in daily.items()}           # 去掉停牌日
@@ -79,10 +79,38 @@ def build_panel(frames, verbose=True):
 
 EXCLUDE = {"BULL", "BEAR"}            # 舊的槓桿代幣（下載腳本的過濾抓不到沒有前綴的這兩個）
 
+# 策略只交易加密貨幣：排除商品代幣與代幣化股票
+COMMODITY_TOKENS = {"XAUT", "PAXG"}
+# 幣安 2026-06-11 起上架的代幣化股票（股票代號加 B）
+TOKENIZED_STOCKS = set((
+    "AAOIB AAPLB ADBEB AGPUB ALABB AMATB AMCB AMDB AMZNB ARMB ASMLB ASTSB AVGOB AXTIB BABAB BEB BMNRB "
+    "BNCB CBRSB COHRB COINB CRCLB CRDOB CRMB CRWDB CRWVB CYPHB DELLB DJTB DRAMB EWYB FLNCB FWDIB GLWB "
+    "GMEB GOOGLB GPROB GSB HIMSB HOODB HPEB IBMB INTCB INTWB IRENB KORUB LITEB METAB MRNAB MRVLB "
+    "MSFTB MSTRB MUB MUUB MVLLB NBISB NFLXB NOKB NVDAB ORCLB PDDB PLTRB PYPLB QCOMB QNTB QQQB RDDTB "
+    "RKLBB SHAZB SKHYB SMCIB SMHB SNDKB SNXXB SOXLB SOXSB SPCXB SPYB SQQQB STXB TQQQB TSLAB TSMB "
+    "USARB WDCB WENB ZMB "
+).split())
+TOKENIZED_STOCK_SINCE = pd.Timestamp("2026-06-11", tz="UTC")
+CRYPTO_ENDING_B = set()               # 之後上架、代號以 B 結尾的真正加密貨幣，加在這裡以免被誤判
 
-def clean(frames, max_gap_days=7, redenom_tol=0.1, verbose=True):
+
+def is_non_crypto(sym, first, window_start=None):
     """
-    1. 排除槓桿代幣
+    商品代幣或代幣化股票。名單外的新上架幣：代號以 B 結尾且上架日在 TOKENIZED_STOCK_SINCE 之後，也視為代幣化股票。
+    first：該幣資料的第一天；window_start：資料只抓最近一段時（實盤），抓取起點。
+    只有上架日落在抓取區間內（first 明顯晚於 window_start）才能確定是新上架，避免把 BNB、ARB 這類老幣誤判。
+    """
+    base = sym.split("~")[0]
+    if base in COMMODITY_TOKENS or base in TOKENIZED_STOCKS:
+        return True
+    if not base.endswith("B") or base in CRYPTO_ENDING_B or first < TOKENIZED_STOCK_SINCE:
+        return False
+    return window_start is None or first > window_start + pd.Timedelta(days=3)
+
+
+def clean(frames, max_gap_days=7, redenom_tol=0.1, verbose=True, window_start=None):
+    """
+    1. 排除槓桿代幣、商品代幣、代幣化股票
     2. 交易中斷超過 max_gap_days 天 → 視為重新上架的不同資產，拆成 SYM、SYM~2 …（例：LUNA 崩盤後的新 LUNA）
     3. 單日價格剛好跳 10 / 100 / 1000 倍 → 視為改面額，把之前的價格按比例調整（例：QUICK、SUN、BNX、COCOS）
     """
@@ -92,6 +120,9 @@ def clean(frames, max_gap_days=7, redenom_tol=0.1, verbose=True):
             log.append(f"排除 {sym}")
             continue
         d = d.sort_index()
+        if is_non_crypto(sym, d.index[0], window_start):
+            log.append(f"排除 {sym}（商品代幣或代幣化股票）")
+            continue
         dvol = d["close"].resample("1D").last().pct_change().std()
         if dvol < 0.01:                   # 日波動 <1%：穩定幣、法幣幣、代幣化股票（例：U、KGST、SPYB）
             log.append(f"排除 {sym}（日波動 {dvol:.2%}，非一般加密貨幣）")

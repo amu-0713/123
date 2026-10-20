@@ -29,7 +29,7 @@ PARAMS = dict(
     min_trade_frac=0.005,               # 調倉差額小於帳淨值 0.5% 就不動（省手續費）
 )
 LEDGER_DAYS = {"A": 6, "B": 3}          # A 帳週日、B 帳週四（0=週一 … 6=週日）
-HISTORY_DAYS = 220                      # 每次抓的日 K 根數（指標最長回看 120 天 + 緩衝）
+HISTORY_DAYS = 1000                     # 每次抓的日 K 根數（幣安上限）；指標只需約 120 天，抓長一點才能判斷新上架的代幣化股票
 
 
 def coin_of(name):
